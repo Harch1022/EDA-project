@@ -1,0 +1,9 @@
+project_root: .
+grid_size: 64
+near_critical:
+  mode: "delta_abs"   # 先用绝对阈值，后续可改为论文 "ratio_to_worst"
+  delta_ns: 0.02
+  quantile: 0.10
+save_dir: data/processed
+benches:
+  - my_design

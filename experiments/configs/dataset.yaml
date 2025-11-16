@@ -1,0 +1,9 @@
+project_root: .
+grid_size: 64
+near_critical:
+  mode: "delta_abs"         # delta_abs | quantile
+  delta_ns: 0.02            # 在最差 slack 基础上 +0.02ns 内视为近关键
+  quantile: 0.10            # mode=quantile 时使用
+save_dir: data/processed
+benches:
+  - my_design
