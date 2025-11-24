@@ -1,21 +1,53 @@
 seed: 42
 device: "cpu"   # 如有 CUDA 可改为 "cuda"
+
 train:
   epochs: 3
   batch_size: 16
   lr: 1.0e-3
   weight_decay: 1.0e-4
+
 model:
   gnn_hidden: 64
   gnn_layers: 3
   cnn_channels: [16, 32]
   fusion_hidden: 64
+
 loss:
   use_cpl: true
   cpl_weight: 0.1
   mse_weight: 1.0
+
 data:
   dataset_npz: "data/processed/my_design.npz"
   vocab_json:  "data/processed/vocab.json"
   train_split: 0.8
   val_split: 0.2
+
+# BPN 配置
+bpn:
+  # —— 离线 BPN 分析（供 src/training/train_cpl_bpn.py 使用） ——
+  use_bpn: true           # 保持原有行为
+  steps_fwd: 6
+  steps_bwd: 6
+  decay_fwd: 0.9
+  decay_bwd: 0.9
+  combine: hadamard       # hadamard | sum
+  out_norm: l1            # l1 | l2 | max
+  degree_norm: out        # out | in
+  include_seed: true
+  topk: 5
+  max_endpoints: 10       # 日志里最多打印多少个端点的 topK
+  save_maps: true
+
+  # —— 训练融合：BPN 辅助监督（供 src/training/train_cpl.py 使用） ——
+  use_bpn_in_loss: false  # 默认关闭；设为 true 启用辅助 loss（不破坏现有流程）
+  bpn_loss_type: kl       # kl | mse | l1
+  bpn_loss_weight: 0.1    # 辅助 loss 的权重
+  temperature: 1.0        # 节点重要性 head 的 softmax 温度
+  importance_npz: null    # 可选：显式指定老师分布 npz；null 时自动推导为 <dataset>_bpn_importance.npz
+
+# 供 train_cpl_bpn.py 解析数据集路径使用
+dataset_path: data/processed/my_design.npz
+project_root: .
+design: my_design

@@ -1,9 +1,24 @@
 project_root: .
+save_dir: data/processed
 grid_size: 64
+
+benches:
+  - my_design   # 这里保持你的设计名，如果有多个设计就继续往下加
+
 near_critical:
-  mode: "delta_abs"   # 先用绝对阈值，后续可改为论文 "ratio_to_worst"
+  # 新增模式：'ratio_to_worst' | 兼容旧模式：'delta_abs' | 'quantile' | 'best_only'
+  mode: ratio_to_worst
+
+  # 针对 ratio_to_worst 的端点级筛选配置：
+  ratio_metric: arrival   # 可选：arrival | slack
+  top_ratio: 1.0          # 先用 1.0，不过滤端点；后续可改 0.1 / 0.05 做消融
+
+  # ratio_to_worst 内部（端点内）的路径选择方式：
+  inner_mode: delta_abs   # 可选：delta_abs | quantile | best_only
+
+  # 内部模式对应的参数（当 inner_mode=delta_abs/quantile 时生效）：
   delta_ns: 0.02
   quantile: 0.10
-save_dir: data/processed
-benches:
-  - my_design
+
+  # 是否保留未选中的端点（仅给它们 best_only 标签），方便兼容旧流程：
+  keep_non_selected: false
