@@ -10,6 +10,7 @@ export PROJECT_ROOT
 
 export DESIGN_DIR="$PROJECT_ROOT/data/benchmarks/$DESIGN_NAME"
 export OUT_DIR="$PROJECT_ROOT/data/raw_eda/$DESIGN_NAME"
+
 mkdir -p "$OUT_DIR"
 
 # 二进制回退：优先系统PATH，其次项目内 build 产物
@@ -116,11 +117,13 @@ YS_FILE="$OUT_DIR/synth.ys"
 } > "$YS_FILE"
 
 # 1) 综合
+echo "### 1. Running Synthesis (Yosys) ###"
 echo "[1/3] Synthesis (Yosys)"
 "$YOSYS_BIN" -l "$OUT_DIR/yosys.log" -s "$YS_FILE"
 test -s "$SYNTH_NETLIST" || { echo "ERROR: synthesis failed (netlist missing)."; exit 1; }
 
 # 2) PnR
+echo "### 2. Running Place & Route (OpenROAD) ###"
 echo "[2/3] Place & Route (OpenROAD)"
 export SDC_FILE  # 传入 pnr.tcl
 "$OPENROAD_BIN" -no_init -exit "$PROJECT_ROOT/eda_flow/pnr.tcl" 2>&1 | tee "$OUT_DIR/openroad.log"
@@ -151,4 +154,5 @@ open(E("metadata.json"),"w").write(json.dumps(md, indent=2))
 print("metadata.json written")
 PY
 
+echo "### Data Generation for ${DESIGN_NAME} COMPLETED ###"
 echo "DONE. Outputs in $OUT_DIR"
