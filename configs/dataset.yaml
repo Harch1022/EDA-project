@@ -21,4 +21,4 @@ near_critical:
   quantile: 0.10
 
   # 是否保留未选中的端点（仅给它们 best_only 标签），方便兼容旧流程：
-  keep_non_selected: false
+  keep_non_selected: true

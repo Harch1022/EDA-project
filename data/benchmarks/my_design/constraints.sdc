@@ -1,8 +1,15 @@
-# 定义一个 100MHz 时钟（周期 10ns），连到端口 i_Clock
-create_clock -name core_clk -period 10 [get_ports i_Clock]
+current_design aes_cipher_top
 
-# 除了时钟外，其他输入的到达时间设为 0ns（相当于很宽松）
-set_input_delay 0 -clock core_clk [all_inputs]
+set clk_name clk
+set clk_port_name clk
+set clk_period 0.82
+set clk_io_pct 0.2
 
-# 输出的要求时间也设为 0ns
-set_output_delay 0 -clock core_clk [all_outputs]
+set clk_port [get_ports $clk_port_name]
+
+create_clock -name $clk_name -period $clk_period $clk_port
+
+set non_clock_inputs [all_inputs -no_clocks]
+
+set_input_delay [expr $clk_period * $clk_io_pct] -clock $clk_name $non_clock_inputs
+set_output_delay [expr $clk_period * $clk_io_pct] -clock $clk_name [all_outputs]

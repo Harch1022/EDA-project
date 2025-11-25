@@ -18,7 +18,15 @@ class BPN(nn.Module):
         self.layers = nn.ModuleList()
         last = d_in
         for _ in range(layers):
-            self.layers.append(GraphConv(last, hidden, norm='both'))
+            # 关键改动：allow_zero_in_degree=True，避免 0 入度节点报错
+            self.layers.append(
+                GraphConv(
+                    last,
+                    hidden,
+                    norm='both',
+                    allow_zero_in_degree=True
+                )
+            )
             last = hidden
         self.readout = nn.Sequential(
             nn.Linear(hidden, hidden),

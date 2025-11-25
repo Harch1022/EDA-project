@@ -2,7 +2,7 @@ seed: 42
 device: "cpu"   # 如有 CUDA 可改为 "cuda"
 
 train:
-  epochs: 3
+  epochs: 20
   batch_size: 16
   lr: 1.0e-3
   weight_decay: 1.0e-4
@@ -12,10 +12,20 @@ model:
   gnn_layers: 3
   cnn_channels: [16, 32]
   fusion_hidden: 64
+  # 旧版开关，为兼容保留；真正行为由 endpoint_conditioning.mode 决定
+  use_endpoint_condition: true
+  endpoint_dim: 16
+
+  # 新增：端点条件化模式
+  endpoint_conditioning:
+    # 可选: none | id | teacher_pool | hybrid
+    mode: teacher_pool
+    d_ep: 16        # 仅 id / hybrid 下的 ID embedding 维度
+    dropout: 0.3    # 仅 id / hybrid 下，对 ID embedding 的 dropout
 
 loss:
-  use_cpl: true
-  cpl_weight: 0.1
+  use_cpl: false
+  cpl_weight: 0.0
   mse_weight: 1.0
 
 data:
@@ -27,7 +37,7 @@ data:
 # BPN 配置
 bpn:
   # —— 离线 BPN 分析（供 src/training/train_cpl_bpn.py 使用） ——
-  use_bpn: true           # 保持原有行为
+  use_bpn: false           # 保持原有行为
   steps_fwd: 6
   steps_bwd: 6
   decay_fwd: 0.9
@@ -41,13 +51,20 @@ bpn:
   save_maps: true
 
   # —— 训练融合：BPN 辅助监督（供 src/training/train_cpl.py 使用） ——
-  use_bpn_in_loss: false  # 默认关闭；设为 true 启用辅助 loss（不破坏现有流程）
+  use_bpn_in_loss: false  # E1/E0 先关掉；E2/E3 设为 true
   bpn_loss_type: kl       # kl | mse | l1
-  bpn_loss_weight: 0.1    # 辅助 loss 的权重
+  bpn_loss_weight: 0.1    # base 辅助 loss 的权重
   temperature: 1.0        # 节点重要性 head 的 softmax 温度
-  importance_npz: null    # 可选：显式指定老师分布 npz；null 时自动推导为 <dataset>_bpn_importance.npz
+  importance_npz: null    # null 时自动推导为 <dataset>_bpn_importance.npz
+  ablation: none          # none | shuffle | random（老师分布扰动）
+  ablation_seed: 123
+  warmup_epochs: 10       # BPN loss 预热 epoch 数（权重=0）
+  ramp_epochs: 20         # 从 0 线性爬升到 bpn_loss_weight 的 epoch 数
 
 # 供 train_cpl_bpn.py 解析数据集路径使用
 dataset_path: data/processed/my_design.npz
 project_root: .
 design: my_design
+
+debug:
+  limit_train_samples: 0   # >0 时裁剪训练样本数做过拟合体检
