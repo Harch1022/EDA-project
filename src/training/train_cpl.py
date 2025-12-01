@@ -58,6 +58,20 @@ class EndpointDataset(Dataset):
         self.y_arrival = self.data["y_arrival"]          # [E]
         self.cpl_indices = self.data["cpl_indices"]      # list[list[int]]
 
+        # 可视化需要的 name_to_idx / idx_to_name
+        self.name_to_idx: Optional[Dict[str, int]] = None
+        self.idx_to_name: Optional[Dict[int, str]] = None
+        if "name_to_idx" in self.data.files:
+            try:
+                pairs = self.data["name_to_idx"]
+                mapping: Dict[str, int] = {}
+                for name, idx in pairs:
+                    mapping[str(name)] = int(idx)
+                self.name_to_idx = mapping
+                self.idx_to_name = {idx: name for name, idx in mapping.items()}
+            except Exception as e:
+                logger.warning("Failed to parse name_to_idx from dataset npz: %s", e)
+
         # 构建 DGL 图与张量
         import dgl
         import torch as T
@@ -105,13 +119,18 @@ def _load_bpn_importance(importance_npz: str, num_nodes: int) -> Optional[Dict[s
     若文件不存在或形状不匹配，返回 None。
     """
     if not os.path.exists(importance_npz):
-        logger.info("BPN importance file not found: %s (will skip BPN loss / teacher_pool)", importance_npz)
+        logger.info(
+            "BPN importance file not found: %s (will skip BPN loss / teacher_pool)",
+            importance_npz,
+        )
         return None
     arr = np.load(importance_npz, allow_pickle=True)
     endpoints = [str(e) for e in arr["endpoints"]]
     importance = arr["importance"].astype(np.float32)
     if importance.ndim != 2:
-        logger.warning("BPN importance has invalid ndim=%d, expect 2. Skip.", importance.ndim)
+        logger.warning(
+            "BPN importance has invalid ndim=%d, expect 2. Skip.", importance.ndim
+        )
         return None
     if importance.shape[1] != num_nodes:
         logger.warning(
@@ -137,7 +156,9 @@ def _compute_bpn_loss(
     计算节点重要性分布的辅助损失。返回标量张量。
     """
     device = p_model.device
-    p_teacher = torch.from_numpy(p_teacher_np).to(device=device, dtype=p_model.dtype)  # [N]
+    p_teacher = torch.from_numpy(p_teacher_np).to(
+        device=device, dtype=p_model.dtype
+    )  # [N]
     eps = 1e-12
 
     if loss_type == "mse":
@@ -150,6 +171,148 @@ def _compute_bpn_loss(
     p_m = torch.clamp(p_model, min=eps)
     kl = torch.sum(p_t * (torch.log(p_t) - torch.log(p_m)))
     return kl
+
+
+def dump_node_importance_for_dataset(
+    npz_path: str,
+    ds: EndpointDataset,
+    bpn: BPN,
+    imp_head: Optional[NodeImportanceHead],
+    teacher: Optional[Dict[str, Any]],
+    device: torch.device,
+    vis_cfg: Dict[str, Any],
+) -> None:
+    """
+    在训练结束后，根据 vis 配置导出节点重要性，用于后续热力图可视化。
+
+    npz 结构:
+      - endpoints: [E] (object)
+      - importance: [E, N] (float32, 每行是一个 endpoint 的节点概率分布)
+      - node_names: [N] (object, 可选，按节点索引顺序)
+    """
+    dump_flag = bool(vis_cfg.get("dump_node_importance", False))
+    if not dump_flag:
+        return
+
+    source = str(vis_cfg.get("source", "model")).lower()
+    if source not in ("model", "teacher"):
+        logger.warning(
+            "vis.source=%s 非法，将回退为 'model'（可选值: 'model' 或 'teacher'）",
+            source,
+        )
+        source = "model"
+
+    eps_cfg = vis_cfg.get("endpoints", [])
+    target_eps: Optional[set[str]]
+    if eps_cfg:
+        target_eps = {str(e) for e in eps_cfg}
+        logger.info("可视化只导出指定 endpoints（共 %d 个）。", len(target_eps))
+    else:
+        target_eps = None  # None 表示导出所有 endpoint
+
+    outdir = vis_cfg.get("outdir", None)
+    if not outdir:
+        # 默认放到 dataset 所在目录的子目录 vis_node_importance
+        outdir = os.path.join(os.path.dirname(npz_path), "vis_node_importance")
+    os.makedirs(outdir, exist_ok=True)
+
+    # 前置条件检查
+    if source == "model" and imp_head is None:
+        logger.error(
+            "vis.source='model' 但训练过程中未构造 imp_head "
+            "(通常是因为 bpn.use_bpn_in_loss=False 或老师分布未成功加载)。"
+            "将跳过节点重要性导出。"
+        )
+        return
+
+    if source == "teacher" and (teacher is None or "map_by_name" not in teacher):
+        logger.error(
+            "vis.source='teacher' 但 teacher importance 不可用。"
+            "请检查 bpn.importance_npz 或 bpn.use_bpn_in_loss 配置。"
+        )
+        return
+
+    # 构造 node_names（按节点索引顺序）
+    N_nodes = ds.node_features.shape[0]
+    node_names: List[str] = [f"node_{i}" for i in range(N_nodes)]
+    if getattr(ds, "idx_to_name", None):
+        for idx, name in ds.idx_to_name.items():  # type: ignore[arg-type]
+            if 0 <= idx < N_nodes:
+                node_names[idx] = str(name)
+
+    # source=model: 先算一次全图的节点分布
+    p_model_np: Optional[np.ndarray] = None
+    if source == "model":
+        logger.info("使用 model 源导出节点重要性（NodeImportanceHead 输出）。")
+        bpn.eval()
+        assert imp_head is not None
+        imp_head.eval()
+        with torch.no_grad():
+            g = ds.g.to(device)
+            x = ds.x.to(device)
+            g_emb, node_emb = bpn(g, x, return_node_emb=True)  # node_emb: [N, d]
+            p = imp_head(node_emb)  # [N]
+            p = torch.clamp(p, min=0.0)
+            s = p.sum()
+            if s <= 0:
+                p = torch.ones_like(p) / float(p.numel())
+            else:
+                p = p / s
+            p_model_np = p.detach().cpu().numpy().astype(np.float32)
+
+    # source=teacher: 直接取 teacher["map_by_name"]（已经在 train_loop 中扩展到所有 endpoint）
+    teacher_map: Dict[str, np.ndarray] = {}
+    if source == "teacher":
+        logger.info("使用 teacher 源导出节点重要性（BPN 老师分布）。")
+        teacher_map = teacher["map_by_name"]  # type: ignore[index]
+
+    sel_endpoints: List[str] = []
+    importance_rows: List[np.ndarray] = []
+
+    for ep in ds.endpoints:
+        ep_name = str(ep)
+        if target_eps is not None and ep_name not in target_eps:
+            continue
+
+        if source == "model":
+            assert p_model_np is not None
+            sel_endpoints.append(ep_name)
+            importance_rows.append(p_model_np.copy())
+        else:
+            vec = teacher_map.get(ep_name, None)
+            if vec is None:
+                # 万一某个 endpoint 没有老师分布，就退化成均匀分布
+                vec = np.ones(N_nodes, dtype=np.float32)
+                vec /= float(N_nodes)
+            sel_endpoints.append(ep_name)
+            importance_rows.append(vec.astype(np.float32))
+
+    if not sel_endpoints:
+        logger.warning(
+            "vis.dump_node_importance=True，但根据 vis.endpoints 筛选后没有任何 endpoint 被导出。"
+        )
+        return
+
+    endpoints_np = np.array(sel_endpoints, dtype=object)
+    importance_np = np.stack(importance_rows, axis=0)
+    node_names_np = np.array(node_names, dtype=object)
+
+    base = os.path.splitext(os.path.basename(npz_path))[0]
+    tag = source
+    out_path = os.path.join(outdir, f"{base}_node_importance_{tag}.npz")
+    np.savez_compressed(
+        out_path,
+        endpoints=endpoints_np,
+        importance=importance_np,
+        node_names=node_names_np,
+    )
+    logger.info(
+        "节点重要性已导出到 %s (source=%s, #endpoints=%d, #nodes=%d)",
+        out_path,
+        source,
+        len(sel_endpoints),
+        N_nodes,
+    )
 
 
 def train_loop(cfg: Dict[str, object]):
@@ -182,7 +345,9 @@ def train_loop(cfg: Dict[str, object]):
     legacy_d_ep = int(model_cfg.get("endpoint_dim", 16))
 
     ep_cond_cfg = model_cfg.get("endpoint_conditioning", {}) or {}
-    ep_mode = str(ep_cond_cfg.get("mode", "id" if legacy_use_ep else "none")).lower()
+    ep_mode = str(
+        ep_cond_cfg.get("mode", "id" if legacy_use_ep else "none")
+    ).lower()
     d_ep_id = int(ep_cond_cfg.get("d_ep", legacy_d_ep))
     drop_ep = float(ep_cond_cfg.get("dropout", 0.0))
 
@@ -208,7 +373,9 @@ def train_loop(cfg: Dict[str, object]):
     ablation_seed = int(bpn_cfg.get("ablation_seed", seed + 2024))
 
     # 是否需要加载老师分布（BPN loss 或 teacher_pool/hybrid）
-    need_teacher = use_bpn_in_loss or (use_ep_condition and ep_mode in ("teacher_pool", "hybrid"))
+    need_teacher = use_bpn_in_loss or (
+        use_ep_condition and ep_mode in ("teacher_pool", "hybrid")
+    )
     teacher: Optional[Dict[str, Any]] = None
     p_teacher_t: Dict[str, torch.Tensor] = {}  # 用于 teacher_pool 的 Torch 版分布
 
@@ -231,7 +398,9 @@ def train_loop(cfg: Dict[str, object]):
                 names = list(base_map.keys())
                 imp_vecs = [base_map[n] for n in names]
                 perm = rng.permutation(len(names))
-                ablated_map = {names[i]: imp_vecs[perm[i]] for i in range(len(names))}
+                ablated_map = {
+                    names[i]: imp_vecs[perm[i]] for i in range(len(names))
+                }
                 logger.info("BPN ablation=shuffle is ON.")
             elif ablation == "random":
                 ablated_map = {}
@@ -246,7 +415,9 @@ def train_loop(cfg: Dict[str, object]):
                 logger.info("BPN ablation=random is ON.")
             else:
                 if ablation != "none":
-                    logger.warning("Unknown ablation='%s', fallback to 'none'.", ablation)
+                    logger.warning(
+                        "Unknown ablation='%s', fallback to 'none'.", ablation
+                    )
                 ablated_map = base_map
                 logger.info("BPN ablation=none.")
 
@@ -260,19 +431,27 @@ def train_loop(cfg: Dict[str, object]):
                     vec = np.ones(N_nodes, dtype=np.float32)
                     vec /= float(N_nodes)
                 map_by_name_full[name] = vec
-                p_teacher_t[name] = torch.from_numpy(vec.astype(np.float32))
+                p_teacher_t[name] = torch.from_numpy(
+                    vec.astype(np.float32)
+                )
 
-            teacher["map_by_name"] = map_by_name_full
+            teacher["map_by_name"] = map_by_name_full  # type: ignore[index]
 
     # 如果模式需要 teacher_pool，但最终没拿到老师分布，则报错提示
-    if use_ep_condition and ep_mode in ("teacher_pool", "hybrid") and (teacher is None or not p_teacher_t):
+    if (
+        use_ep_condition
+        and ep_mode in ("teacher_pool", "hybrid")
+        and (teacher is None or not p_teacher_t)
+    ):
         raise RuntimeError(
             f"endpoint_conditioning.mode='{ep_mode}' 需要 BPN importance 文件，"
             f"但未能成功加载: {importance_npz}"
         )
 
     if use_bpn_in_loss and teacher is None:
-        logger.info("BPN loss is enabled but teacher maps unavailable. Will skip BPN loss.")
+        logger.info(
+            "BPN loss is enabled but teacher maps unavailable. Will skip BPN loss."
+        )
         use_bpn_in_loss = False
 
     # ------------------------------------------------------------------
@@ -292,7 +471,9 @@ def train_loop(cfg: Dict[str, object]):
     num_endpoints = len(ds)
 
     if use_ep_condition and ep_mode in ("id", "hybrid"):
-        ep_emb = EndpointEmbedding(num_endpoints=num_endpoints, d_ep=d_ep_id).to(device)
+        ep_emb = EndpointEmbedding(
+            num_endpoints=num_endpoints, d_ep=d_ep_id
+        ).to(device)
         ep_dropout = nn.Dropout(p=drop_ep).to(device)
         logger.info(
             "Using endpoint ID embedding: num_endpoints=%d, d_ep=%d, dropout=%.2f",
@@ -324,7 +505,9 @@ def train_loop(cfg: Dict[str, object]):
             d_ep_in,
         )
     else:
-        head = FusionRegressor(d_gnn=gnn_hidden, d_cnn=gnn_hidden, hidden=fusion_hidden).to(device)
+        head = FusionRegressor(
+            d_gnn=gnn_hidden, d_cnn=gnn_hidden, hidden=fusion_hidden
+        ).to(device)
         logger.info("Using original FusionRegressor (no endpoint conditioning).")
 
     # 节点重要性 head（仅在开启 BPN loss 时创建，并加入优化器）
@@ -345,7 +528,9 @@ def train_loop(cfg: Dict[str, object]):
     # 优化器：主体参数 +（可选）ID embedding 参数单独 weight_decay
     param_groups: List[Dict[str, Any]] = [
         {
-            "params": list(bpn.parameters()) + list(cnn.parameters()) + list(head.parameters()),
+            "params": list(bpn.parameters())
+            + list(cnn.parameters())
+            + list(head.parameters()),
             "weight_decay": float(cfg["train"].get("weight_decay", 1.0e-4)),
         }
     ]
@@ -392,10 +577,14 @@ def train_loop(cfg: Dict[str, object]):
     limit_train = int(debug_cfg.get("limit_train_samples", 0))
     if limit_train > 0:
         old_n = len(tr_idx)
-        tr_idx = tr_idx[:min(limit_train, len(tr_idx))]
+        tr_idx = tr_idx[: min(limit_train, len(tr_idx))]
         logger.info("Debug: limit_train_samples=%d (from %d)", len(tr_idx), old_n)
 
-    logger.info("Split: %d train endpoints, %d val endpoints.", len(tr_idx), len(va_idx))
+    logger.info(
+        "Split: %d train endpoints, %d val endpoints.",
+        len(tr_idx),
+        len(va_idx),
+    )
 
     # ------------------------------------------------------------------
     # BPN loss warmup + ramp-up 配置
@@ -416,7 +605,9 @@ def train_loop(cfg: Dict[str, object]):
     # ------------------------------------------------------------------
     # 训练 / 验证 epoch 循环
     # ------------------------------------------------------------------
-    def run_epoch(idxs: List[int], train: bool = True, bpn_weight: float = 0.0) -> Tuple[float, float]:
+    def run_epoch(
+        idxs: List[int], train: bool = True, bpn_weight: float = 0.0
+    ) -> Tuple[float, float]:
         # 如果没有样本，避免对空数组算 mape 产生 warning
         if not idxs:
             return 0.0, float("nan")
@@ -449,45 +640,57 @@ def train_loop(cfg: Dict[str, object]):
             # 是否需要节点级 embedding（teacher_pool / hybrid / BPN loss）
             need_node_emb = (
                 (use_ep_condition and ep_mode in ("teacher_pool", "hybrid"))
-                or (imp_head is not None and teacher is not None and bpn_weight > 0.0)
+                or (
+                    imp_head is not None
+                    and teacher is not None
+                    and bpn_weight > 0.0
+                )
             )
 
             # 前向：根据 need_node_emb 决定是否返回 node_emb
             if need_node_emb:
                 g_emb, node_emb = bpn(g, x, return_node_emb=True)  # [d], [N, d]
             else:
-                g_emb = bpn(g, x)                                 # [d]
+                g_emb = bpn(g, x)  # [d]
                 node_emb = None
 
-            gnn_emb = g_emb.unsqueeze(0)      # [1, d]
-            cnn_emb = cnn(maps)               # [1, d]
+            gnn_emb = g_emb.unsqueeze(0)  # [1, d]
+            cnn_emb = cnn(maps)  # [1, d]
 
             # ====== 端点条件化：根据 ep_mode 构造 z_ep ======
             if use_ep_condition:
                 if ep_mode == "teacher_pool":
                     assert node_emb is not None, "teacher_pool mode requires node_emb"
-                    pt = p_teacher_t[ep_name_str].to(device)          # [N]
-                    z_ep = torch.matmul(pt.unsqueeze(0), node_emb)    # [1, d_node]
+                    pt = p_teacher_t[ep_name_str].to(device)  # [N]
+                    z_ep = torch.matmul(
+                        pt.unsqueeze(0), node_emb
+                    )  # [1, d_node]
 
                 elif ep_mode == "id":
                     assert ep_emb is not None and ep_dropout is not None
-                    ep_idx_t = torch.tensor([int(ep_id)], dtype=torch.long, device=device)  # [1]
-                    z_ep = ep_dropout(ep_emb(ep_idx_t))                                    # [1, d_ep_id]
+                    ep_idx_t = torch.tensor(
+                        [int(ep_id)], dtype=torch.long, device=device
+                    )  # [1]
+                    z_ep = ep_dropout(ep_emb(ep_idx_t))  # [1, d_ep_id]
 
                 elif ep_mode == "hybrid":
                     assert node_emb is not None
                     assert ep_emb is not None and ep_dropout is not None
-                    pt = p_teacher_t[ep_name_str].to(device)          # [N]
-                    z_struct = torch.matmul(pt.unsqueeze(0), node_emb)  # [1, d_node]
-                    ep_idx_t = torch.tensor([int(ep_id)], dtype=torch.long, device=device)  # [1]
-                    z_id = ep_dropout(ep_emb(ep_idx_t))                # [1, d_ep_id]
-                    z_ep = torch.cat([z_id, z_struct], dim=-1)         # [1, d_ep_id + d_node]
+                    pt = p_teacher_t[ep_name_str].to(device)  # [N]
+                    z_struct = torch.matmul(
+                        pt.unsqueeze(0), node_emb
+                    )  # [1, d_node]
+                    ep_idx_t = torch.tensor(
+                        [int(ep_id)], dtype=torch.long, device=device
+                    )  # [1]
+                    z_id = ep_dropout(ep_emb(ep_idx_t))  # [1, d_ep_id]
+                    z_ep = torch.cat([z_id, z_struct], dim=-1)  # [1, d_ep_id + d_node]
                 else:
                     raise ValueError(f"Unknown ep_mode={ep_mode}")
 
-                y_pred = head(gnn_emb, cnn_emb, z_ep)   # [1]
+                y_pred = head(gnn_emb, cnn_emb, z_ep)  # [1]
             else:
-                y_pred = head(gnn_emb, cnn_emb)         # [1]
+                y_pred = head(gnn_emb, cnn_emb)  # [1]
             # ============================================================
 
             y_t = torch.tensor([y], dtype=torch.float32, device=device)
@@ -504,7 +707,9 @@ def train_loop(cfg: Dict[str, object]):
                 and teacher is not None
             ):
                 # 需要该 endpoint 的老师分布
-                p_teacher_np = teacher["map_by_name"].get(ep_name_str, None)
+                p_teacher_np = teacher["map_by_name"].get(
+                    ep_name_str, None
+                )  # type: ignore[index]
                 if p_teacher_np is not None:
                     p_model = imp_head(node_emb)  # [N]
                     bpn_loss = _compute_bpn_loss(
@@ -540,11 +745,15 @@ def train_loop(cfg: Dict[str, object]):
             # R2、MAE、RMSE
             r2_val = float(r2_score(y_true_np, y_pred_np))
             mae = float(np.mean(np.abs(y_true_np - y_pred_np)))
-            rmse = float(sqrt(np.mean((y_true_np - y_pred_np) ** 2)))
+            rmse = float(
+                sqrt(np.mean((y_true_np - y_pred_np) ** 2))
+            )
 
             avg_total = total_loss_sum / max(len(idxs), 1)
             avg_main = main_loss_sum / max(len(idxs), 1)
-            avg_bpn = (bpn_loss_sum / max(count_bpn, 1)) if count_bpn > 0 else 0.0
+            avg_bpn = (
+                (bpn_loss_sum / max(count_bpn, 1)) if count_bpn > 0 else 0.0
+            )
 
             split_name = "train" if train else "val"
             logger.info(
@@ -581,7 +790,9 @@ def train_loop(cfg: Dict[str, object]):
         tr_loss, tr_mape = run_epoch(tr_idx, train=True, bpn_weight=w_bpn)
 
         if va_idx:
-            va_loss, va_mape = run_epoch(va_idx, train=False, bpn_weight=w_bpn)
+            va_loss, va_mape = run_epoch(
+                va_idx, train=False, bpn_weight=w_bpn
+            )
             logger.info(
                 "[Epoch %d/%d] train_loss=%.4f mape=%.4f | val_loss=%.4f mape=%.4f",
                 ep,
@@ -621,21 +832,72 @@ def train_loop(cfg: Dict[str, object]):
         "val_samples": len(va_idx),
         "epochs": epochs,
         "use_bpn_in_loss": use_bpn_in_loss and (teacher is not None),
-        "bpn_loss_type": bpn_loss_type if (use_bpn_in_loss and teacher is not None) else "disabled",
-        "bpn_loss_weight_base": base_bpn_loss_weight if (use_bpn_in_loss and teacher is not None) else 0.0,
+        "bpn_loss_type": (
+            bpn_loss_type if (use_bpn_in_loss and teacher is not None) else "disabled"
+        ),
+        "bpn_loss_weight_base": (
+            base_bpn_loss_weight
+            if (use_bpn_in_loss and teacher is not None)
+            else 0.0
+        ),
         "warmup_epochs": warmup_ep,
         "ramp_epochs": ramp_ep,
         "use_endpoint_condition": use_ep_condition,
-        "endpoint_dim_id": d_ep_id if use_ep_condition and ep_mode in ("id", "hybrid") else 0,
+        "endpoint_dim_id": (
+            d_ep_id if use_ep_condition and ep_mode in ("id", "hybrid") else 0
+        ),
         "endpoint_mode": ep_mode,
     }
     with open(os.path.join(save_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
-    logger.info("Training done. Metrics saved to %s", os.path.join(save_dir, "metrics.json"))
+    logger.info(
+        "Training done. Metrics saved to %s",
+        os.path.join(save_dir, "metrics.json"),
+    )
+
+    # ------------------------------------------------------------------
+    # 可选：导出节点重要性（用于后续热力图）
+    # ------------------------------------------------------------------
+    vis_cfg = cfg.get("vis", {}) or {}
+    if bool(vis_cfg.get("dump_node_importance", False)):
+        best_ckpt = os.path.join(save_dir, "best.pt")
+        if os.path.exists(best_ckpt):
+            try:
+                state = torch.load(best_ckpt, map_location=device)
+                bpn.load_state_dict(state["bpn"])
+                cnn.load_state_dict(state["cnn"])
+                head.load_state_dict(state["head"])
+                if imp_head is not None and "imp_head" in state:
+                    imp_head.load_state_dict(state["imp_head"])
+                if ep_emb is not None and "ep_emb" in state:
+                    ep_emb.load_state_dict(state["ep_emb"])
+                logger.info(
+                    "Loaded best checkpoint from %s for node-importance dumping.",
+                    best_ckpt,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to load best checkpoint from %s: %s. "
+                    "Will use last-epoch weights.",
+                    best_ckpt,
+                    e,
+                )
+
+        dump_node_importance_for_dataset(
+            npz_path=npz_path,
+            ds=ds,
+            bpn=bpn,
+            imp_head=imp_head,
+            teacher=teacher,
+            device=device,
+            vis_cfg=vis_cfg,
+        )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train CPL-based model with optional BPN auxiliary loss.")
+    parser = argparse.ArgumentParser(
+        description="Train CPL-based model with optional BPN auxiliary loss."
+    )
     parser.add_argument("--config", type=str, default="configs/model.yaml")
     args = parser.parse_args()
 
