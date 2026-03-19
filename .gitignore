@@ -28,3 +28,9 @@ checkpoints/
 data/processed/
 data/raw_eda/
 *.npz
+OpenROAD-flow-scripts/
+eda_env/
+*.npz
+*.pt
+data/raw_eda/
+eda_flow/lib/
