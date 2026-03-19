@@ -3,7 +3,8 @@ save_dir: data/processed
 grid_size: 64
 
 benches:
-  - my_design   # 这里保持你的设计名，如果有多个设计就继续往下加
+  - my_design
+  - s298  # 这里保持你的设计名，如果有多个设计就继续往下加
 
 near_critical:
   # 新增模式：'ratio_to_worst' | 兼容旧模式：'delta_abs' | 'quantile' | 'best_only'
