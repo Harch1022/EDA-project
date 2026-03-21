@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import random
-import glob  # <--- 新增
+import glob
 from typing import Dict, Tuple, List, Any, Optional
 
 import numpy as np
@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import yaml
-from torch.utils.data import Dataset, ConcatDataset  # <--- 新增 ConcatDataset
+from torch.utils.data import Dataset, ConcatDataset
 
 from src.models.bpn import BPN
 from src.models.cnn import PhysCNN
@@ -40,9 +40,9 @@ def set_seed(seed: int):
 class EndpointDataset(Dataset):
     def __init__(self, npz_path: str):
         super().__init__()
-        self.npz_path = npz_path  # <--- 新增：保存路径，方便后续索骥
-        self.teacher_map = None   # <--- 新增：预留存放各自 BPN 老师分布的位置
-        self.p_teacher_t = {}     # <--- 新增：预留存放张量化老师分布的位置
+        self.npz_path = npz_path
+        self.teacher_map = None
+        self.p_teacher_t = {}
 
         self.data = np.load(npz_path, allow_pickle=True)
 
@@ -99,8 +99,8 @@ class EndpointDataset(Dataset):
         y = float(self.y_arrival[idx])
         ci = list(self.cpl_indices[idx])
         ep_name = str(self.endpoints[idx])
-        ep_id = idx  
-        # <--- 核心修改：把 self 也返回出去，充当“移动的图结构仓库”
+        ep_id = idx
+        # 把 self 也返回出去，充当“移动的图结构仓库”
         return ep_id, y, ci, ep_name, self
 
 
@@ -126,18 +126,120 @@ def _load_bpn_importance(importance_npz: str, num_nodes: int) -> Optional[Dict[s
     return {"endpoints": endpoints, "importance": imp, "map_by_name": mp}
 
 
-def _compute_bpn_loss(p_model: torch.Tensor, p_teacher_np: np.ndarray, loss_type: str = "kl") -> torch.Tensor:
+def _compute_bpn_loss(
+    p_model: torch.Tensor,
+    p_teacher_ref: np.ndarray | torch.Tensor,
+    loss_type: str = "kl",
+) -> torch.Tensor:
     device = p_model.device
-    p_teacher = torch.from_numpy(p_teacher_np).to(device=device, dtype=p_model.dtype)
+    if isinstance(p_teacher_ref, torch.Tensor):
+        p_teacher = p_teacher_ref.to(device=device, dtype=p_model.dtype)
+    else:
+        p_teacher = torch.from_numpy(np.asarray(p_teacher_ref)).to(device=device, dtype=p_model.dtype)
+
     eps = 1e-12
     if loss_type == "mse":
         return F.mse_loss(p_model, p_teacher)
     if loss_type == "l1":
         return torch.mean(torch.abs(p_model - p_teacher))
+
     p_t = torch.clamp(p_teacher, min=eps)
     p_m = torch.clamp(p_model, min=eps)
     kl = torch.sum(p_t * (torch.log(p_t) - torch.log(p_m)))
     return kl
+
+
+def _topk_recall_single(y_true: np.ndarray, y_pred: np.ndarray, frac: float = 0.10, mode: str = "high") -> float:
+    if y_true.size == 0:
+        return float("nan")
+    frac = 0.10 if frac <= 0.0 else min(float(frac), 1.0)
+    n = int(y_true.shape[0])
+    k = max(1, int(round(n * frac)))
+    k = min(k, n)
+
+    if mode == "low":
+        true_idx = set(np.argpartition(y_true, k - 1)[:k].tolist())
+        pred_idx = set(np.argpartition(y_pred, k - 1)[:k].tolist())
+    else:
+        true_idx = set(np.argpartition(y_true, n - k)[-k:].tolist())
+        pred_idx = set(np.argpartition(y_pred, n - k)[-k:].tolist())
+
+    return float(len(true_idx & pred_idx) / max(k, 1))
+
+
+def _groupwise_topk_recall(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    groups: np.ndarray,
+    frac: float = 0.10,
+    mode: str = "high",
+) -> float:
+    if y_true.size == 0:
+        return float("nan")
+
+    vals: List[float] = []
+    for gid in np.unique(groups):
+        mask = groups == gid
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        if yt.size == 0:
+            continue
+        vals.append(_topk_recall_single(yt, yp, frac=frac, mode=mode))
+
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def _kendall_tau_np(y_true: np.ndarray, y_pred: np.ndarray, tie_epsilon: float = 1e-12) -> float:
+    n = int(y_true.shape[0])
+    if n < 2:
+        return float("nan")
+
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    diff_t = y_true[idx_i] - y_true[idx_j]
+    valid = np.abs(diff_t) > tie_epsilon
+    if not np.any(valid):
+        return float("nan")
+
+    diff_p = y_pred[idx_i] - y_pred[idx_j]
+    sign_t = np.sign(diff_t[valid])
+    sign_p = np.sign(diff_p[valid])
+
+    concord = np.sum(sign_t == sign_p)
+    discord = np.sum(sign_t != sign_p)
+    denom = max(int(concord + discord), 1)
+    return float((concord - discord) / denom)
+
+
+def _groupwise_kendall_tau(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    groups: np.ndarray,
+    max_samples_per_group: int = 1024,
+    seed: int = 42,
+) -> float:
+    if y_true.size == 0:
+        return float("nan")
+
+    rng = np.random.default_rng(seed)
+    vals: List[float] = []
+
+    for gid in np.unique(groups):
+        mask = groups == gid
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        if yt.size < 2:
+            continue
+
+        if max_samples_per_group > 0 and yt.size > max_samples_per_group:
+            sel = rng.choice(yt.size, size=max_samples_per_group, replace=False)
+            yt = yt[sel]
+            yp = yp[sel]
+
+        tau = _kendall_tau_np(yt, yp)
+        if not np.isnan(tau):
+            vals.append(float(tau))
+
+    return float(np.mean(vals)) if vals else float("nan")
 
 
 def dump_node_importance_for_dataset(
@@ -149,7 +251,6 @@ def dump_node_importance_for_dataset(
     device: torch.device,
     vis_cfg: Dict[str, Any],
 ) -> None:
-    # (此函数无需大幅修改，维持原逻辑即可，外部会循环调用它)
     dump_flag = bool(vis_cfg.get("dump_node_importance", False))
     if not dump_flag:
         return
@@ -235,16 +336,20 @@ def train_loop(cfg: Dict[str, object]):
     seed = int(cfg.get("seed", 42))
     set_seed(seed)
 
-    # ------------------------------------------------------------------
-    # 【多设计加载核心改造】
-    # ------------------------------------------------------------------
     data_cfg = cfg.get("data", {}) or {}
+    model_cfg = cfg.get("model", {}) or {}
+    train_cfg = cfg.get("train", {}) or {}
+    loss_cfg = cfg.get("loss", {}) or {}
+    debug_cfg = cfg.get("debug", {}) or {}
+
+    # ------------------------------------------------------------------
+    # 多设计加载
+    # ------------------------------------------------------------------
     base_npz_path = data_cfg.get("dataset_npz")
     if not base_npz_path:
         raise ValueError("Please provide dataset_npz in config to infer directory.")
-    
+
     data_dir = os.path.dirname(base_npz_path)
-    # 扫描目录下所有的 .npz，但排除 importance 和 node_importance 文件
     all_files = glob.glob(os.path.join(data_dir, "*.npz"))
     valid_files = [f for f in all_files if "importance" not in os.path.basename(f)]
     valid_files.sort()
@@ -261,14 +366,22 @@ def train_loop(cfg: Dict[str, object]):
 
     concat_ds = ConcatDataset(datasets)
     n = len(concat_ds)
-    # 提取特征维度 (假设所有设计的特征维度一致)
-    d_node = datasets[0].node_features.shape[1] 
+    d_node = datasets[0].node_features.shape[1]
     logger.info("Concatenated %d endpoints from %d designs.", n, len(datasets))
+
+    # 建立 global_idx -> design_id 映射（ConcatDataset 的顺序与 datasets 一致）
+    global_idx_to_design = np.empty(n, dtype=np.int64)
+    all_targets_global = np.empty(n, dtype=np.float32)
+    cursor = 0
+    for design_id, ds in enumerate(datasets):
+        m = len(ds)
+        global_idx_to_design[cursor: cursor + m] = design_id
+        all_targets_global[cursor: cursor + m] = np.asarray(ds.y_arrival, dtype=np.float32)
+        cursor += m
 
     # ------------------------------------------------------------------
     # 端点条件化配置
     # ------------------------------------------------------------------
-    model_cfg = cfg.get("model", {}) or {}
     legacy_use_ep = bool(model_cfg.get("use_endpoint_condition", False))
     legacy_d_ep = int(model_cfg.get("endpoint_dim", 16))
     ep_cond_cfg = model_cfg.get("endpoint_conditioning", {}) or {}
@@ -296,15 +409,18 @@ def train_loop(cfg: Dict[str, object]):
             imp_path = _infer_bpn_importance_path(ds.npz_path)
             N_ds_nodes = ds.node_features.shape[0]
             teacher = _load_bpn_importance(imp_path, num_nodes=N_ds_nodes)
-            
+
             if teacher is None:
                 logger.warning("Teacher not found for %s. Fallback to uniform.", ds.npz_path)
-                ds.teacher_map = {str(ep): np.ones(N_ds_nodes, dtype=np.float32) / N_ds_nodes for ep in ds.endpoints}
+                ds.teacher_map = {
+                    str(ep): np.ones(N_ds_nodes, dtype=np.float32) / N_ds_nodes
+                    for ep in ds.endpoints
+                }
             else:
                 has_any_teacher = True
                 rng = np.random.default_rng(ablation_seed)
                 base_map = teacher["map_by_name"]
-                
+
                 if ablation == "shuffle":
                     names = list(base_map.keys())
                     imp_vecs = [base_map[n] for n in names]
@@ -349,10 +465,8 @@ def train_loop(cfg: Dict[str, object]):
 
     ep_emb: Optional[EndpointEmbedding] = None
     ep_dropout: Optional[nn.Dropout] = None
-    
-    # 全局总的端点数量 (用于 ID 嵌入)
-    num_endpoints_global = n  
 
+    num_endpoints_global = n
     if use_ep_condition and ep_mode in ("id", "hybrid"):
         ep_emb = EndpointEmbedding(num_endpoints=num_endpoints_global, d_ep=d_ep_id).to(device)
         ep_dropout = nn.Dropout(p=drop_ep).to(device)
@@ -375,161 +489,425 @@ def train_loop(cfg: Dict[str, object]):
     if use_bpn_in_loss and has_any_teacher:
         imp_head = NodeImportanceHead(d_in=gnn_hidden, temperature=temperature, normalize="softmax").to(device)
 
+    # ------------------------------------------------------------------
+    # 新复合损失
+    # ------------------------------------------------------------------
     loss_fn = CplLoss(
-        mse_weight=float(cfg["loss"].get("mse_weight", 1.0)),
-        cpl_weight=float(cfg["loss"].get("cpl_weight", 0.1)),
+        mse_weight=float(loss_cfg.get("mse_weight", 1.0)),
+        rank_weight=float(
+            loss_cfg.get("rank_weight", loss_cfg.get("ranking_weight", loss_cfg.get("pairwise_weight", 0.2)))
+        ),
+        cpl_weight=float(loss_cfg.get("cpl_weight", 0.1)),
+        critical_fraction=float(loss_cfg.get("critical_fraction", loss_cfg.get("topk_fraction", 0.10))),
+        critical_weight=float(loss_cfg.get("critical_weight", loss_cfg.get("cp_aware_weight", 2.0))),
+        critical_mode=str(loss_cfg.get("critical_mode", "high")).lower(),
+        pairwise_margin=float(loss_cfg.get("pairwise_margin", 0.0)),
+        pairwise_loss=str(loss_cfg.get("pairwise_loss", "logistic")).lower(),
+        pair_gap_power=float(loss_cfg.get("pair_gap_power", 0.0)),
+        tie_epsilon=float(loss_cfg.get("tie_epsilon", 1e-8)),
+        max_pairs=int(loss_cfg.get("max_pairs", 0)),
     )
+
+    # 这里的 batch_size 是“逻辑 micro-batch”大小，不是图拼 batch
+    loss_batch_size = int(train_cfg.get("batch_size", loss_cfg.get("ranking_batch_size", 16)))
+    loss_batch_size = max(loss_batch_size, 1)
+
+    recall_top_fraction = float(loss_cfg.get("recall_top_fraction", loss_fn.critical_fraction if loss_fn.critical_fraction > 0 else 0.10))
+    if recall_top_fraction <= 0.0:
+        recall_top_fraction = 0.10
+    tau_max_samples_per_group = int(loss_cfg.get("tau_max_samples_per_group", 1024))
+
+    logger.info(
+        "Loss setup: mse_w=%.3f rank_w=%.3f cpl_w=%.3f critical_frac=%.3f critical_w=%.3f mode=%s micro_batch=%d",
+        loss_fn.mse_weight,
+        loss_fn.rank_weight,
+        loss_fn.cpl_weight,
+        loss_fn.critical_fraction,
+        loss_fn.critical_weight,
+        loss_fn.critical_mode,
+        loss_batch_size,
+    )
+    if loss_fn.rank_weight > 0.0 and loss_batch_size < 2:
+        logger.warning("batch_size < 2, pairwise ranking will be ineffective.")
 
     param_groups: List[Dict[str, Any]] = [{
         "params": list(bpn.parameters()) + list(cnn.parameters()) + list(head.parameters()),
-        "weight_decay": float(cfg["train"].get("weight_decay", 1.0e-4)),
+        "weight_decay": float(train_cfg.get("weight_decay", 1.0e-4)),
     }]
     if imp_head is not None:
         param_groups[0]["params"] += list(imp_head.parameters())
     if ep_emb is not None:
         param_groups.append({"params": list(ep_emb.parameters()), "weight_decay": 1.0e-3})
 
-    opt = torch.optim.Adam(param_groups, lr=float(cfg["train"].get("lr", 1e-3)))
+    opt = torch.optim.Adam(param_groups, lr=float(train_cfg.get("lr", 1e-3)))
 
     train_split = float(data_cfg.get("train_split", 0.8))
     indices = list(range(n))
     random.shuffle(indices)
     n_train = int(round(n * train_split))
-    if n_train == 0 and n > 0: n_train = 1
-    if n_train > n: n_train = n
+    if n_train == 0 and n > 0:
+        n_train = 1
+    if n_train > n:
+        n_train = n
 
     tr_idx = indices[:n_train]
     va_idx = indices[n_train:]
 
-    limit_train = int(cfg.get("debug", {}).get("limit_train_samples", 0))
+    limit_train = int(debug_cfg.get("limit_train_samples", 0))
     if limit_train > 0:
         tr_idx = tr_idx[: min(limit_train, len(tr_idx))]
+
+    # ------------------------------------------------------------------
+    # 针对 CP-aware weighting：按 split + 按 design 计算阈值
+    # ------------------------------------------------------------------
+    def _compute_design_thresholds(split_indices: List[int]) -> Dict[int, float]:
+        crit_frac = float(loss_fn.critical_fraction)
+        crit_weight = float(loss_fn.critical_weight)
+        crit_mode = str(loss_fn.critical_mode).lower()
+
+        if crit_frac <= 0.0 or crit_weight <= 1.0 or not split_indices:
+            return {}
+
+        q = crit_frac if crit_mode == "low" else 1.0 - crit_frac
+        q = float(np.clip(q, 0.0, 1.0))
+
+        buckets: Dict[int, List[float]] = {}
+        for gi in split_indices:
+            did = int(global_idx_to_design[gi])
+            buckets.setdefault(did, []).append(float(all_targets_global[gi]))
+
+        thresholds: Dict[int, float] = {}
+        for did, vals in buckets.items():
+            arr = np.asarray(vals, dtype=np.float32)
+            if arr.size > 0:
+                thresholds[did] = float(np.quantile(arr, q))
+        return thresholds
+
+    train_design_thresholds = _compute_design_thresholds(tr_idx)
+    val_design_thresholds = _compute_design_thresholds(va_idx)
+
+    # ------------------------------------------------------------------
+    # 为 ranking loss 构造按 design 分组的 epoch 顺序
+    # 这样每个微批次都来自同一个 design，避免跨设计 pairwise 排序
+    # ------------------------------------------------------------------
+    def _build_epoch_order(split_indices: List[int], train: bool = True) -> List[int]:
+        if not split_indices:
+            return []
+
+        buckets: Dict[int, List[int]] = {}
+        for gi in split_indices:
+            did = int(global_idx_to_design[gi])
+            buckets.setdefault(did, []).append(gi)
+
+        design_ids = list(buckets.keys())
+        if train:
+            random.shuffle(design_ids)
+            for did in design_ids:
+                random.shuffle(buckets[did])
+        else:
+            design_ids.sort()
+
+        ordered: List[int] = []
+        for did in design_ids:
+            ordered.extend(buckets[did])
+        return ordered
+
+    def _cp_sample_weight(y_value: float, design_id: int, design_thresholds: Dict[int, float]) -> float:
+        if not design_thresholds:
+            return 1.0
+
+        thr = design_thresholds.get(design_id, None)
+        if thr is None:
+            return 1.0
+
+        if loss_fn.critical_mode == "low":
+            return float(loss_fn.critical_weight) if float(y_value) <= thr else 1.0
+        return float(loss_fn.critical_weight) if float(y_value) >= thr else 1.0
 
     warmup_ep = int(bpn_cfg.get("warmup_epochs", 0))
     ramp_ep = int(bpn_cfg.get("ramp_epochs", 0))
 
     def get_bpn_weight(epoch: int) -> float:
-        if not (use_bpn_in_loss and has_any_teacher): return 0.0
-        if warmup_ep > 0 and epoch <= warmup_ep: return 0.0
+        if not (use_bpn_in_loss and has_any_teacher):
+            return 0.0
+        if warmup_ep > 0 and epoch <= warmup_ep:
+            return 0.0
         if ramp_ep > 0 and epoch <= warmup_ep + ramp_ep:
             return base_bpn_loss_weight * (epoch - warmup_ep) / max(ramp_ep, 1)
         return base_bpn_loss_weight
 
     # ------------------------------------------------------------------
-    # 动态前向传播改造
+    # 动态前向传播 + 逻辑微批次累计
     # ------------------------------------------------------------------
-    def run_epoch(idxs: List[int], train: bool = True, bpn_weight: float = 0.0) -> Tuple[float, float]:
+    def run_epoch(
+        idxs: List[int],
+        train: bool = True,
+        bpn_weight: float = 0.0,
+        design_thresholds: Optional[Dict[int, float]] = None,
+    ) -> Tuple[float, float]:
         if not idxs:
             return 0.0, float("nan")
 
-        y_true_all, y_pred_all = [], []
-        total_loss_sum, main_loss_sum, bpn_loss_sum, count_bpn = 0.0, 0.0, 0.0, 0
-        
-        bpn.train(train); cnn.train(train); head.train(train)
-        if imp_head: imp_head.train(train)
-        if ep_emb: ep_emb.train(train)
+        work_idxs = _build_epoch_order(idxs, train=train)
 
-        for global_idx in idxs:
-            # 动态接住当前的数据集对象 current_ds 
-            local_ep_id, y, ci, ep_name, current_ds = concat_ds[global_idx]
-            ep_name_str = str(ep_name)
+        y_true_all: List[float] = []
+        y_pred_all: List[float] = []
+        group_all: List[int] = []
 
-            # 动态加载对应设计的图和特征
-            g = current_ds.g.to(device)
-            x = current_ds.x.to(device)
-            maps = current_ds.maps_t.to(device)
+        total_loss_sum = 0.0
+        core_loss_sum = 0.0
+        mse_term_sum = 0.0
+        rank_term_sum = 0.0
+        cpl_term_sum = 0.0
+        bpn_term_sum = 0.0
+        num_samples = 0
 
-            need_node_emb = ((use_ep_condition and ep_mode in ("teacher_pool", "hybrid"))
-                             or (imp_head is not None and current_ds.teacher_map is not None and bpn_weight > 0.0))
+        bpn.train(train)
+        cnn.train(train)
+        head.train(train)
+        if imp_head is not None:
+            imp_head.train(train)
+        if ep_emb is not None:
+            ep_emb.train(train)
 
-            if need_node_emb:
-                g_emb, node_emb = bpn(g, x, return_node_emb=True)
-            else:
-                g_emb = bpn(g, x)
-                node_emb = None
+        pending_preds: List[torch.Tensor] = []
+        pending_targets: List[torch.Tensor] = []
+        pending_graph_embs: List[torch.Tensor] = []
+        pending_cpl_indices: List[List[int]] = []
+        pending_sample_weights: List[torch.Tensor] = []
+        pending_group_ids: List[int] = []
+        pending_bpn_losses: List[torch.Tensor] = []
+        pending_design_id: Optional[int] = None
 
-            gnn_emb = g_emb.unsqueeze(0)
-            cnn_emb = cnn(maps)
+        def flush_pending() -> None:
+            nonlocal total_loss_sum, core_loss_sum
+            nonlocal mse_term_sum, rank_term_sum, cpl_term_sum, bpn_term_sum
+            nonlocal num_samples
 
-            if use_ep_condition:
-                if ep_mode == "teacher_pool":
-                    pt = current_ds.p_teacher_t[ep_name_str].to(device)
-                    z_ep = torch.matmul(pt.unsqueeze(0), node_emb)
+            if not pending_preds:
+                return
 
-                elif ep_mode == "id":
-                    # 使用 global_idx 避免多个设计 id 冲撞
-                    ep_idx_t = torch.tensor([int(global_idx)], dtype=torch.long, device=device)
-                    z_ep = ep_dropout(ep_emb(ep_idx_t))
+            batch_size_cur = len(pending_preds)
 
-                elif ep_mode == "hybrid":
-                    pt = current_ds.p_teacher_t[ep_name_str].to(device)
-                    z_struct = torch.matmul(pt.unsqueeze(0), node_emb)
-                    ep_idx_t = torch.tensor([int(global_idx)], dtype=torch.long, device=device)
-                    z_id = ep_dropout(ep_emb(ep_idx_t))
-                    z_ep = torch.cat([z_id, z_struct], dim=-1)
+            y_pred_b = torch.stack(pending_preds, dim=0).reshape(-1)
+            y_true_b = torch.stack(pending_targets, dim=0).reshape(-1)
+            gnn_emb_b = torch.stack(pending_graph_embs, dim=0)
+            sample_weight_b = torch.stack(pending_sample_weights, dim=0).reshape(-1)
+            group_ids_b = torch.tensor(pending_group_ids, dtype=torch.long, device=device)
 
-                y_pred = head(gnn_emb, cnn_emb, z_ep)
-            else:
-                y_pred = head(gnn_emb, cnn_emb)
+            core_loss, loss_detail = loss_fn(
+                y_pred=y_pred_b,
+                y_true=y_true_b,
+                gnn_emb=gnn_emb_b,
+                cpl_indices=pending_cpl_indices,
+                sample_weight=sample_weight_b,
+                group_ids=group_ids_b,
+                return_details=True,
+            )
 
-            y_t = torch.tensor([y], dtype=torch.float32, device=device)
-            main_loss = loss_fn(y_pred, y_t, gnn_emb, cpl_indices=[ci])
-            loss = main_loss
-
-            # 从 current_ds 获取 BPN 老师分布
-            if bpn_weight > 0.0 and imp_head is not None and node_emb is not None and current_ds.teacher_map is not None:
-                p_teacher_np = current_ds.teacher_map.get(ep_name_str, None)
-                if p_teacher_np is not None:
-                    p_model = imp_head(node_emb)
-                    bpn_loss = _compute_bpn_loss(p_model, p_teacher_np, loss_type=bpn_loss_type)
-                    loss = loss + bpn_weight * bpn_loss
-                    bpn_loss_sum += float(bpn_loss.detach().cpu())
-                    count_bpn += 1
+            total_loss = core_loss
+            if bpn_weight > 0.0 and pending_bpn_losses:
+                bpn_aux = torch.stack(pending_bpn_losses, dim=0).mean()
+                total_loss = total_loss + bpn_weight * bpn_aux
+                bpn_term_sum += float((bpn_weight * bpn_aux).detach().cpu()) * batch_size_cur
 
             if train:
-                opt.zero_grad()
-                loss.backward()
+                opt.zero_grad(set_to_none=True)
+                total_loss.backward()
                 opt.step()
 
-            total_loss_sum += float(loss.detach().cpu())
-            main_loss_sum += float(main_loss.detach().cpu())
-            y_true_all.append(y)
-            y_pred_all.append(float(y_pred.detach().cpu()))
+            total_loss_sum += float(total_loss.detach().cpu()) * batch_size_cur
+            core_loss_sum += float(core_loss.detach().cpu()) * batch_size_cur
+            mse_term_sum += float(loss_detail["mse_term"].detach().cpu()) * batch_size_cur
+            rank_term_sum += float(loss_detail["rank_term"].detach().cpu()) * batch_size_cur
+            cpl_term_sum += float(loss_detail["cpl_term"].detach().cpu()) * batch_size_cur
+            num_samples += batch_size_cur
+
+            pending_preds.clear()
+            pending_targets.clear()
+            pending_graph_embs.clear()
+            pending_cpl_indices.clear()
+            pending_sample_weights.clear()
+            pending_group_ids.clear()
+            pending_bpn_losses.clear()
+
+        grad_ctx = torch.enable_grad() if train else torch.no_grad()
+        with grad_ctx:
+            for global_idx in work_idxs:
+                design_id = int(global_idx_to_design[global_idx])
+
+                # design 切换时先 flush，保证 ranking batch 不跨设计
+                if pending_design_id is not None and design_id != pending_design_id and pending_preds:
+                    flush_pending()
+                    pending_design_id = None
+
+                if pending_design_id is None:
+                    pending_design_id = design_id
+
+                local_ep_id, y, ci, ep_name, current_ds = concat_ds[global_idx]
+                ep_name_str = str(ep_name)
+
+                g = current_ds.g.to(device)
+                x = current_ds.x.to(device)
+                maps = current_ds.maps_t.to(device)
+
+                need_node_emb = (
+                    (use_ep_condition and ep_mode in ("teacher_pool", "hybrid"))
+                    or (imp_head is not None and current_ds.teacher_map is not None and bpn_weight > 0.0)
+                )
+
+                if need_node_emb:
+                    g_emb, node_emb = bpn(g, x, return_node_emb=True)
+                else:
+                    g_emb = bpn(g, x)
+                    node_emb = None
+
+                gnn_emb = g_emb.unsqueeze(0)
+                cnn_emb = cnn(maps)
+
+                if use_ep_condition:
+                    if ep_mode == "teacher_pool":
+                        pt = current_ds.p_teacher_t[ep_name_str].to(device=device, dtype=node_emb.dtype)
+                        z_ep = torch.matmul(pt.unsqueeze(0), node_emb)
+
+                    elif ep_mode == "id":
+                        ep_idx_t = torch.tensor([int(global_idx)], dtype=torch.long, device=device)
+                        z_ep = ep_dropout(ep_emb(ep_idx_t))
+
+                    elif ep_mode == "hybrid":
+                        pt = current_ds.p_teacher_t[ep_name_str].to(device=device, dtype=node_emb.dtype)
+                        z_struct = torch.matmul(pt.unsqueeze(0), node_emb)
+                        ep_idx_t = torch.tensor([int(global_idx)], dtype=torch.long, device=device)
+                        z_id = ep_dropout(ep_emb(ep_idx_t))
+                        z_ep = torch.cat([z_id, z_struct], dim=-1)
+
+                    else:
+                        raise ValueError(f"Unknown endpoint conditioning mode={ep_mode}")
+
+                    y_pred = head(gnn_emb, cnn_emb, z_ep)
+                else:
+                    y_pred = head(gnn_emb, cnn_emb)
+
+                y_pred_scalar = y_pred.reshape(-1)[0]
+                y_target_scalar = torch.tensor(float(y), dtype=torch.float32, device=device)
+                sample_w_scalar = torch.tensor(
+                    _cp_sample_weight(float(y), design_id, design_thresholds or {}),
+                    dtype=torch.float32,
+                    device=device,
+                )
+
+                pending_preds.append(y_pred_scalar)
+                pending_targets.append(y_target_scalar)
+                pending_graph_embs.append(gnn_emb.squeeze(0))
+                pending_cpl_indices.append(list(ci))
+                pending_sample_weights.append(sample_w_scalar)
+                pending_group_ids.append(design_id)
+
+                if bpn_weight > 0.0 and imp_head is not None and node_emb is not None and current_ds.teacher_map is not None:
+                    p_teacher_ref = None
+                    if getattr(current_ds, "p_teacher_t", None):
+                        p_teacher_ref = current_ds.p_teacher_t.get(ep_name_str, None)
+                    if p_teacher_ref is None and current_ds.teacher_map is not None:
+                        p_teacher_ref = current_ds.teacher_map.get(ep_name_str, None)
+
+                    if p_teacher_ref is not None:
+                        p_model = imp_head(node_emb)
+                        pending_bpn_losses.append(
+                            _compute_bpn_loss(p_model, p_teacher_ref, loss_type=bpn_loss_type)
+                        )
+
+                y_true_all.append(float(y))
+                y_pred_all.append(float(y_pred_scalar.detach().cpu()))
+                group_all.append(design_id)
+
+                if len(pending_preds) >= loss_batch_size:
+                    flush_pending()
+                    pending_design_id = None
+
+            flush_pending()
 
         y_true_np = np.array(y_true_all, dtype=np.float32)
         y_pred_np = np.array(y_pred_all, dtype=np.float32)
+        group_np = np.array(group_all, dtype=np.int64)
+
+        avg_total = total_loss_sum / max(num_samples, 1)
+        avg_core = core_loss_sum / max(num_samples, 1)
+        avg_mse_term = mse_term_sum / max(num_samples, 1)
+        avg_rank_term = rank_term_sum / max(num_samples, 1)
+        avg_cpl_term = cpl_term_sum / max(num_samples, 1)
+        avg_bpn_term = bpn_term_sum / max(num_samples, 1)
 
         if y_true_np.size > 0:
-            avg_total = total_loss_sum / max(len(idxs), 1)
-            avg_main = main_loss_sum / max(len(idxs), 1)
-            avg_bpn = (bpn_loss_sum / max(count_bpn, 1)) if count_bpn > 0 else 0.0
-            r2_val = float(r2_score(y_true_np, y_pred_np))
-            logger.info("Split=%s: total=%.4f main=%.4f bpn=%.4f (count=%d) R2=%.4f",
-                        "train" if train else "val", avg_total, avg_main, avg_bpn, count_bpn, r2_val)
+            r2_val = float(r2_score(y_true_np, y_pred_np)) if y_true_np.size > 1 else float("nan")
+            tau_val = _groupwise_kendall_tau(
+                y_true_np,
+                y_pred_np,
+                group_np,
+                max_samples_per_group=tau_max_samples_per_group,
+                seed=seed + (1 if train else 2),
+            )
+            recall_val = _groupwise_topk_recall(
+                y_true_np,
+                y_pred_np,
+                group_np,
+                frac=recall_top_fraction,
+                mode=loss_fn.critical_mode,
+            )
 
-        return total_loss_sum / max(len(idxs), 1), float(mape(y_true_np, y_pred_np))
+            logger.info(
+                "Split=%s: total=%.4f core=%.4f mse=%.4f rank=%.4f cpl=%.4f bpn=%.4f R2=%.4f Tau=%.4f Recall@%.0f%%=%.4f",
+                "train" if train else "val",
+                avg_total,
+                avg_core,
+                avg_mse_term,
+                avg_rank_term,
+                avg_cpl_term,
+                avg_bpn_term,
+                r2_val,
+                tau_val,
+                recall_top_fraction * 100.0,
+                recall_val,
+            )
 
-    epochs = int(cfg["train"].get("epochs", 3))
+        mape_val = float(mape(y_true_np, y_pred_np)) if y_true_np.size > 0 else float("nan")
+        return avg_total, mape_val
+
+    epochs = int(train_cfg.get("epochs", 3))
     best_val = float("inf")
     save_dir = os.path.dirname(base_npz_path)
     os.makedirs(save_dir, exist_ok=True)
 
     for ep in range(1, epochs + 1):
         w_bpn = get_bpn_weight(ep)
-        tr_loss, tr_mape = run_epoch(tr_idx, train=True, bpn_weight=w_bpn)
+        logger.info("[Epoch %d/%d] bpn_weight=%.4f", ep, epochs, w_bpn)
+
+        tr_loss, tr_mape = run_epoch(
+            tr_idx,
+            train=True,
+            bpn_weight=w_bpn,
+            design_thresholds=train_design_thresholds,
+        )
+
         if va_idx:
-            va_loss, va_mape = run_epoch(va_idx, train=False, bpn_weight=w_bpn)
+            va_loss, va_mape = run_epoch(
+                va_idx,
+                train=False,
+                bpn_weight=w_bpn,
+                design_thresholds=val_design_thresholds,
+            )
             if va_loss < best_val:
                 best_val = va_loss
                 state = {"bpn": bpn.state_dict(), "cnn": cnn.state_dict(), "head": head.state_dict()}
-                if imp_head: state["imp_head"] = imp_head.state_dict()
-                if ep_emb: state["ep_emb"] = ep_emb.state_dict()
+                if imp_head:
+                    state["imp_head"] = imp_head.state_dict()
+                if ep_emb:
+                    state["ep_emb"] = ep_emb.state_dict()
                 torch.save(state, os.path.join(save_dir, "best.pt"))
         else:
             logger.info("[Epoch %d/%d] train_loss=%.4f mape=%.4f", ep, epochs, tr_loss, tr_mape)
 
     # ------------------------------------------------------------------
-    # 修复可视化导出逻辑 (遍历每个设计)
+    # 可视化导出逻辑
     # ------------------------------------------------------------------
     vis_cfg = cfg.get("vis", {}) or {}
     if bool(vis_cfg.get("dump_node_importance", False)):
@@ -537,15 +915,17 @@ def train_loop(cfg: Dict[str, object]):
         if os.path.exists(best_ckpt):
             try:
                 state = torch.load(best_ckpt, map_location=device)
-                bpn.load_state_dict(state["bpn"]); cnn.load_state_dict(state["cnn"]); head.load_state_dict(state["head"])
-                if imp_head and "imp_head" in state: imp_head.load_state_dict(state["imp_head"])
-                if ep_emb and "ep_emb" in state: ep_emb.load_state_dict(state["ep_emb"])
-            except Exception as e:
+                bpn.load_state_dict(state["bpn"])
+                cnn.load_state_dict(state["cnn"])
+                head.load_state_dict(state["head"])
+                if imp_head and "imp_head" in state:
+                    imp_head.load_state_dict(state["imp_head"])
+                if ep_emb and "ep_emb" in state:
+                    ep_emb.load_state_dict(state["ep_emb"])
+            except Exception:
                 pass
-        
-        # 遍历 ConcatDataset 里的每一个子数据集进行导出
+
         for ds in datasets:
-            # 临时重组 teacher 字典形式，以兼容 dump 接口
             temp_teacher = {"map_by_name": ds.teacher_map} if ds.teacher_map else None
             dump_node_importance_for_dataset(
                 npz_path=ds.npz_path,
@@ -557,6 +937,7 @@ def train_loop(cfg: Dict[str, object]):
                 vis_cfg=vis_cfg,
             )
 
+
 def main():
     parser = argparse.ArgumentParser(description="Train CPL-based model with optional BPN auxiliary loss.")
     parser.add_argument("--config", type=str, default="configs/model.yaml")
@@ -564,6 +945,7 @@ def main():
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
     train_loop(cfg)
+
 
 if __name__ == "__main__":
     main()
