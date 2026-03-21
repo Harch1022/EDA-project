@@ -16,7 +16,10 @@ from src.eda_parser.liberty_parser import (
     parse_liberty_pin_directions,
     build_cell_output_index,
 )
-from src.features.graph_builder import build_graph
+from src.features.graph_builder import (
+    build_graph,
+    normalized_decay_manhattan,
+)
 from src.features.cnn_maps import build_physical_maps
 from src.labels.cpl import compute_cpl_labels
 from src.labels.mapping import name_to_node_idx
@@ -29,7 +32,8 @@ def load_metadata(project_root: str, design: str) -> Dict:
     out_dir = os.path.join(project_root, "data", "raw_eda", design)
     meta_path = os.path.join(out_dir, "metadata.json")
     if not os.path.exists(meta_path):
-        raise FileNotFoundError(f"metadata.json not found: {meta_path}")
+        logger.warning(f"metadata.json not found for {design}, falling back to heuristics.")
+        return {}
     with open(meta_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -52,6 +56,17 @@ def onehot_types(
     return m
 
 
+def _to_object_array(items: List[object]) -> np.ndarray:
+    """
+    显式构造 1D object array，避免在所有子列表长度刚好一样时，
+    numpy 意外把它堆成规则 2D 数组。
+    """
+    arr = np.empty(len(items), dtype=object)
+    for i, item in enumerate(items):
+        arr[i] = item
+    return arr
+
+
 def _load_cell_outputs_from_liberty(meta: Dict) -> Optional[Dict[str, set]]:
     lib_path = None
     try:
@@ -59,6 +74,7 @@ def _load_cell_outputs_from_liberty(meta: Dict) -> Optional[Dict[str, set]]:
         lib_path = maybe.get("lib", None) or maybe.get("liberty", None)
     except Exception:
         lib_path = None
+
     if lib_path and os.path.exists(lib_path):
         try:
             pin_dirs = parse_liberty_pin_directions(lib_path)
@@ -87,27 +103,35 @@ def process_one_design(
     post_timing = os.path.join(out_dir, f"{design}.post_route_timing.rpt")
     meta = load_metadata(project_root, design)
 
-    # 1) 解析网表并构建图
+    # 1) 解析网表
     instances, net2pins, ports = parse_gate_level_verilog(synth_v)
-    cell_outputs = _load_cell_outputs_from_liberty(meta)
-    g, name_to_idx, base_node_feats = build_graph(
-        instances, net2pins, ports, cell_outputs=cell_outputs
-    )
 
-    # 2) 节点特征：基础特征 + cell type one-hot
-    cell_types = [str(instances[n]["type"]) for n in instances.keys()]
-    if vocab is None:
-        vocab = build_vocab(cell_types)
-    type_onehot = onehot_types(instances, vocab)
-    node_features = np.concatenate([base_node_feats, type_onehot], axis=1)
-
-    # 3) 物理 CNN 特征图
+    # 2) 先解析 DEF：后面建图时要用坐标计算 edge weight
     def_path = post_def if os.path.exists(post_def) else pre_def
     comps, die_area, pins_xy = parse_def(def_path)
     if not die_area:
         logger.warning("No DIEAREA; fallback to synthetic die area.")
         die_area = ((0, 0), (10000, 10000))
 
+    # 3) 构建图，并在图边上写入归一化 Manhattan distance
+    cell_outputs = _load_cell_outputs_from_liberty(meta)
+    g, name_to_idx, base_node_feats = build_graph(
+        instances,
+        net2pins,
+        ports,
+        cell_outputs=cell_outputs,
+        comps=comps,
+        die_area=die_area,
+    )
+
+    # 4) 节点特征：基础特征 + cell type one-hot
+    cell_types = [str(instances[n]["type"]) for n in instances.keys()]
+    if vocab is None:
+        vocab = build_vocab(cell_types)
+    type_onehot = onehot_types(instances, vocab)
+    node_features = np.concatenate([base_node_feats, type_onehot], axis=1)
+
+    # 5) 物理 CNN 特征图（和 edge weight 并不冲突，继续保留）
     maps = build_physical_maps(
         comps,
         die_area,
@@ -117,7 +141,7 @@ def process_one_design(
         prefer_hpwl_rudy=True,
     )
 
-    # 4) 解析 timing 报告，构建 near-critical CPL 标签
+    # 6) 解析 timing 报告，构建 near-critical CPL 标签
     tpath = post_timing if os.path.exists(post_timing) else pre_timing
     paths = parse_report_checks(tpath)
     by_ep = group_by_endpoint(paths)
@@ -145,10 +169,11 @@ def process_one_design(
     endpoints: List[str] = []
     y_arrival: List[float] = []
     cpl_indices: List[List[int]] = []
+    nuiat_times: List[List[float]] = []  # 改动点：与 cpl_indices 一一对齐保存 NUIAT 时间
 
     total_eps = len(by_ep)
 
-    # 5) 只对有 near-critical CPL 的 endpoint 组装数据
+    # 7) 只对有 near-critical CPL 的 endpoint 组装数据
     for ep, lst in near.items():
         if not lst:
             continue
@@ -167,28 +192,60 @@ def process_one_design(
             ]
             arr = -float(min(slks)) if slks else 0.0
 
-        # 从 near-critical 路径中抽取 startpoint 名字并映射到图节点索引
-        starts = [p.get("startpoint", "") for p in lst]
-        idxs = name_to_node_idx(starts, name_to_idx)
+        # -------------------------
+        # 改动点 2：逐条 path 映射，确保 idx 和 nuiat_times 严格对齐
+        # 注意：
+        #   - 这里仍然复用原有 name_to_node_idx 映射逻辑，避免破坏你现有命名兼容性
+        #   - 优先使用 start_arrival（真实 startpoint arrival）
+        #   - 若报告里没解析到，再退回 path arrival，保证可运行
+        # -------------------------
+        idxs: List[int] = []
+        times_this_ep: List[float] = []
+
+        for p in lst:
+            sp_name = str(p.get("startpoint", "")).strip()
+            if not sp_name:
+                continue
+
+            mapped = name_to_node_idx([sp_name], name_to_idx)
+            if mapped is None or len(mapped) == 0:
+                continue
+
+            idxs.append(int(mapped[0]))
+
+            raw_t = p.get("start_arrival", None)
+            if raw_t is None:
+                raw_t = p.get("arrival", None)
+
+            try:
+                t_val = float(raw_t) if raw_t is not None else 0.0
+            except Exception:
+                t_val = 0.0
+
+            times_this_ep.append(float(t_val))
+
         if not idxs:
             continue
 
         endpoints.append(ep)
         y_arrival.append(arr)
         cpl_indices.append(idxs)
+        nuiat_times.append(times_this_ep)
 
     selected_eps = len(endpoints)
 
     import dgl
-    import torch  # 确保张量到 numpy 的转换稳定
+    import torch
 
-    # 6) **关键改动：为每个 (CPL 起点 -> endpoint) 人工加一条图边**
-    #    这样保证在图上至少存在一条从 CPL 起点到 endpoint 的路径，
-    #    避免它们变成互不连通的“孤立点”，方便后续 BPN 做路径解释。
+    # 8) 为 synthetic CPL edges 补边，并同时补 edge weight
+    #    注意：这一步会引入标签侧信息；若你后续做严格泛化评估，请确认不会造成 leakage。
     if endpoints:
         num_nodes = g.num_nodes()
+        idx_to_name = {i: n for n, i in name_to_idx.items()}
+
         extra_src: List[int] = []
         extra_dst: List[int] = []
+        extra_w: List[float] = []
 
         for ep_name, start_idxs in zip(endpoints, cpl_indices):
             ep_idx = name_to_idx.get(ep_name, None)
@@ -201,7 +258,7 @@ def process_one_design(
 
             for s in start_idxs:
                 si = int(s)
-                # 基本有效性检查
+
                 if si < 0 or si >= num_nodes:
                     logger.warning(
                         "CPL start idx %d for endpoint %s out of range [0,%d); skip",
@@ -210,17 +267,42 @@ def process_one_design(
                         num_nodes,
                     )
                     continue
+
                 if si == ep_idx:
-                    # 起点和终点是同一个节点就不用加边
                     continue
+
+                src_name = idx_to_name.get(si, None)
+                if src_name is None:
+                    logger.warning(
+                        "Source idx %d not found in idx_to_name for endpoint %s; skip",
+                        si,
+                        ep_name,
+                    )
+                    continue
+
+                w = normalized_decay_manhattan(
+                    src_name,
+                    ep_name,
+                    comps=comps,
+                    die_area=die_area,
+                    eps=1e-6,
+                )
 
                 extra_src.append(si)
                 extra_dst.append(ep_idx)
+                extra_w.append(w)
 
         if extra_src:
             src_tensor = torch.tensor(extra_src, dtype=torch.int64)
             dst_tensor = torch.tensor(extra_dst, dtype=torch.int64)
-            g = dgl.add_edges(g, src_tensor, dst_tensor)
+            w_tensor = torch.tensor(extra_w, dtype=torch.float32)
+
+            g = dgl.add_edges(
+                g,
+                src_tensor,
+                dst_tensor,
+                data={"weight": w_tensor},
+            )
             logger.info(
                 "Added %d synthetic CPL edges (start -> endpoint) for design %s",
                 len(extra_src),
@@ -232,37 +314,46 @@ def process_one_design(
                 design,
             )
 
-    # 7) 导出最终边列表
+    # 9) 导出最终边列表和边权
     edges = np.stack(
-        [g.edges()[0].numpy(), g.edges()[1].numpy()],
+        [g.edges()[0].cpu().numpy(), g.edges()[1].cpu().numpy()],
         axis=0,
     )
+    edge_weight = g.edata["weight"].cpu().numpy().astype(np.float32)
 
-    # 8) 保存为 npz
+    # 10) 保存为 npz
     os.makedirs(save_dir, exist_ok=True)
     out_npz = os.path.join(save_dir, f"{design}.npz")
     np.savez_compressed(
         out_npz,
         node_features=node_features,
         edges=edges,
+        edge_weight=edge_weight,
         cell_density_map=maps["cell_density_map"],
         rudy_map=maps["rudy_map"],
         macro_mask_map=maps["macro_mask_map"],
         endpoints=np.array(endpoints, dtype=object),
         y_arrival=np.array(y_arrival, dtype=np.float32),
-        cpl_indices=np.array(cpl_indices, dtype=object),
+        cpl_indices=_to_object_array(
+            [np.asarray(x, dtype=np.int64) for x in cpl_indices]
+        ),
+        # 改动点：新增保存 NUIAT 时间，并与 cpl_indices[i][k] 严格对齐
+        nuiat_times=_to_object_array(
+            [np.asarray(x, dtype=np.float32) for x in nuiat_times]
+        ),
         name_to_idx=np.array(list(name_to_idx.items()), dtype=object),
         vocab=np.array(list(vocab.items()), dtype=object),
     )
     logger.info("Saved dataset: %s", out_npz)
 
-    # 9) 更新 vocab.json（跨设计共享 vocab）
+    # 11) 更新 vocab.json（跨设计共享 vocab）
     vocab_json = os.path.join(save_dir, "vocab.json")
     if os.path.exists(vocab_json):
         old = dict(json.load(open(vocab_json, "r", encoding="utf-8")))
         merged = dict(
             sorted(
-                set(list(old.items()) + list(vocab.items())), key=lambda x: x[0]
+                set(list(old.items()) + list(vocab.items())),
+                key=lambda x: x[0],
             )
         )
         with open(vocab_json, "w", encoding="utf-8") as f:
@@ -271,7 +362,7 @@ def process_one_design(
         with open(vocab_json, "w", encoding="utf-8") as f:
             json.dump(vocab, f, indent=2)
 
-    # 10) 返回统计信息
+    # 12) 返回统计信息
     stats_this = {
         "total_endpoints": int(total_eps),
         "selected_endpoints": int(selected_eps),

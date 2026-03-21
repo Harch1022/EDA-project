@@ -5,24 +5,64 @@
 # 工艺/库/输入网表（按需修改）
 # 允许环境变量覆盖，默认回退到 OpenROAD-flow-scripts 的 Nangate45
 proc env_or {name default} {
-  if {[info exists ::env($name)]} { return $::env($name) } { return $default }
+  if {[info exists ::env($name)]} {
+    return $::env($name)
+  } else {
+    return $default
+  }
 }
 
+# 一个小工具：尽量多打一些 timing 路径（兼容不同 OpenROAD/OpenSTA 版本）
+proc report_checks_extended {} {
+  # 公共参数
+  set base_opts {-path_delay min_max -fields {slew cap input_pins} -digits 4 -format full_clock_expanded}
+
+  # 1) 优先尝试 -path_count（部分版本支持）
+  if {![catch {eval report_checks $base_opts -path_count 2000}]} {
+    return
+  }
+
+  # 2) 尝试 -max_paths（有些版本用这个名字）
+  if {![catch {eval report_checks $base_opts -max_paths 2000}]} {
+    return
+  }
+
+  # 3) 尝试 -nworst（某些 STA 接口习惯用的命名）
+  if {![catch {eval report_checks $base_opts -nworst 2000}]} {
+    return
+  }
+
+  # 4) 全都不支持就退回最原始的调用（你之前的行为）
+  eval report_checks $base_opts
+}
+
+# 设计 / 工程目录 / 输出目录
 set DESIGN_NAME [env_or DESIGN_NAME "my_design"]
 set PROJECT_DIR [env_or PROJECT_DIR "/home/lzz_linux/fyp-project"]
 set OUT_DIR     [env_or OUT_DIR     "$PROJECT_DIR/data/raw_eda/$DESIGN_NAME"]
 set SKIP_CTS    [expr {[info exists ::env(SKIP_CTS)] && $::env(SKIP_CTS) ne ""}]
+# 新增：顶层模块名，缺省用 DESIGN_NAME
+set TOP_MODULE  [env_or TOP_MODULE  $DESIGN_NAME]
 
-# 新增：允许使用 eda_flow/lib 路径（与 run_flow.sh 保持一致），若未设置则回退到 OpenROAD-flow-scripts
-# 工艺/库/输入网表（按需修改）
+# 工艺/库/输入网表（按需修改，允许使用 eda_flow/lib 路径）
 set LIB_LIB   [env_or LIB_FILE  "$PROJECT_DIR/tools/OpenROAD-flow-scripts/flow/platforms/nangate45/lib/NangateOpenCellLibrary_typical.lib"]
 set LEF_TECH  [env_or LEF_TECH  "$PROJECT_DIR/tools/OpenROAD-flow-scripts/flow/platforms/nangate45/lef/NangateOpenCellLibrary.tech.lef"]
 set LEF_STD   [env_or LEF_STD   ""]
 set LEF_MACRO [env_or LEF_MACRO "$PROJECT_DIR/tools/OpenROAD-flow-scripts/flow/platforms/nangate45/lef/NangateOpenCellLibrary.macro.lef"]
 set NETLIST   "$OUT_DIR/$DESIGN_NAME.synth.v"
 
-if {![file exists $OUT_DIR]} { file mkdir $OUT_DIR }
+if {![file exists $OUT_DIR]} {
+  file mkdir $OUT_DIR
+}
 
+puts "==> PnR starting"
+puts "    DESIGN_NAME : $DESIGN_NAME"
+puts "    TOP_MODULE  : $TOP_MODULE"
+puts "    PROJECT_DIR : $PROJECT_DIR"
+puts "    OUT_DIR     : $OUT_DIR"
+puts "    NETLIST     : $NETLIST"
+
+# ---------------- 1) 读取工艺库 ----------------
 puts "==> Loading liberty/lef ..."
 read_liberty $LIB_LIB
 read_lef     $LEF_TECH
@@ -35,7 +75,8 @@ if {$LEF_STD ne ""} {
 # ---------------- 2) 读取综合网表并链接 ----------------
 puts "==> Reading synthesized netlist: $NETLIST"
 read_verilog $NETLIST
-link_design $DESIGN_NAME
+# 关键修改：用 TOP_MODULE，而不是 DESIGN_NAME
+link_design $TOP_MODULE
 
 # ---------------- 3) 约束：优先读取 SDC，回退自动识别 ----------------
 if {[info exists ::env(SDC_FILE)] && [file exists $::env(SDC_FILE)]} {
@@ -44,7 +85,10 @@ if {[info exists ::env(SDC_FILE)] && [file exists $::env(SDC_FILE)]} {
 } else {
   set clk_port ""
   foreach p {i_Clock clk clock clk_i clk_in clk0} {
-    if {[llength [get_ports -quiet $p]]} { set clk_port $p; break }
+    if {[llength [get_ports -quiet $p]]} {
+      set clk_port $p
+      break
+    }
   }
   if {$clk_port eq ""} {
     puts "WARN: No clock port found among {i_Clock clk clock clk_i clk_in clk0}; design will be unconstrained."
@@ -92,7 +136,7 @@ puts "==> Pre-route timing reports -> $pre_rpt"
 # 使用 sta::redirect_file_begin / end 把输出写到文件
 sta::redirect_file_begin $pre_rpt
 puts "==== Pre-route timing (report_checks) ===="
-report_checks -path_delay min_max -fields {slew cap input_pins} -digits 4 -format full_clock_expanded
+report_checks_extended
 puts "\n---- Pre-route Summary ----"
 report_worst_slack -max
 report_worst_slack -min
@@ -174,7 +218,7 @@ puts "==> Post-route timing reports -> $post_rpt"
 
 sta::redirect_file_begin $post_rpt
 puts "==== Post-route timing (report_checks) ===="
-report_checks -path_delay min_max -fields {slew cap input_pins} -digits 4 -format full_clock_expanded
+report_checks_extended
 puts "\n---- Post-route Summary ----"
 report_worst_slack -max
 report_worst_slack -min
