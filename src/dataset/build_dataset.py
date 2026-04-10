@@ -150,7 +150,7 @@ def process_one_design(
     mode = str(near_cfg.get("mode", "delta_abs"))
     delta_ns = float(near_cfg.get("delta_ns", 0.02))
     quantile = float(near_cfg.get("quantile", 0.10))
-    ratio_metric = str(near_cfg.get("ratio_metric", "arrival"))
+    ratio_metric = str(near_cfg.get("ratio_metric", "slack"))
     top_ratio = float(near_cfg.get("top_ratio", 1.0))
     inner_mode = str(near_cfg.get("inner_mode", "delta_abs"))
     keep_non_sel = bool(near_cfg.get("keep_non_selected", False))
@@ -178,19 +178,19 @@ def process_one_design(
         if not lst:
             continue
 
-        # 找一个 arrival 时间；如果缺失，用最差 slack 的负值兜底
-        arr = None
+        target_severity = 0.0
+        slks = []
         for p in by_ep.get(ep, []):
-            if p.get("arrival") is not None:
-                arr = float(p["arrival"])
-                break
-        if arr is None:
-            slks = [
-                p.get("slack", None)
-                for p in by_ep.get(ep, [])
-                if p.get("slack", None) is not None
-            ]
-            arr = -float(min(slks)) if slks else 0.0
+            if p.get("slack") is not None:
+                slks.append(float(p["slack"]))
+        
+        if slks:
+            # 核心绝杀：用 -slack 来代表 severity（严重程度）！
+            # 这样原本 slack=-14.53 的节点，severity 变成了 +14.53。
+            # 数值越大，代表越严重！
+            target_severity = -float(min(slks)) 
+        else:
+            target_severity = 0.0
 
         # -------------------------
         # 改动点 2：逐条 path 映射，确保 idx 和 nuiat_times 严格对齐
@@ -228,7 +228,7 @@ def process_one_design(
             continue
 
         endpoints.append(ep)
-        y_arrival.append(arr)
+        y_arrival.append(target_severity)
         cpl_indices.append(idxs)
         nuiat_times.append(times_this_ep)
 
@@ -248,7 +248,8 @@ def process_one_design(
         extra_w: List[float] = []
 
         for ep_name, start_idxs in zip(endpoints, cpl_indices):
-            ep_idx = name_to_idx.get(ep_name, None)
+            mapped_ep = name_to_node_idx([ep_name], name_to_idx)
+            ep_idx = int(mapped_ep[0]) if mapped_ep and len(mapped_ep) > 0 else None
             if ep_idx is None:
                 logger.warning(
                     "Endpoint %s not found in name_to_idx; skip CPL edges for it.",

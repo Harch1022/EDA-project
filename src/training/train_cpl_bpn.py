@@ -290,11 +290,6 @@ def _seed_vector_from_nodes(
 
 # --------------------
 # 一个脚本内置的加权 BPN 兼容实现
-# 说明：
-#   你没有贴 src/models/bpn_propagation.py，
-#   所以这里做一个“兼容 fallback”：
-#   - 若原 BPNPropagator 支持显式 seed 权重，则优先走原实现
-#   - 否则自动回退到这里的加权传播，不需要你改第 4 个文件
 # --------------------
 
 
@@ -505,10 +500,7 @@ class _WeightedBPNFallback:
 
 class _ImportanceComputer:
     """
-    兼容层：
-      - 无 NUIAT 权重时，直接调用原 BPNPropagator
-      - 有 NUIAT 权重时，优先尝试原 BPNPropagator 的加权接口
-      - 若原类没有暴露加权接口，则回退到脚本内置实现
+    兼容层
     """
 
     def __init__(self, bpn: BPNPropagator, weighted_fallback: _WeightedBPNFallback):
@@ -531,7 +523,6 @@ class _ImportanceComputer:
         endpoint_node: Optional[int],
         seed_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # 无 NUIAT 权重：保持你原先的调用路径
         if seed_weights is None:
             return self.bpn.compute_endpoint_importance(
                 g,
@@ -539,7 +530,6 @@ class _ImportanceComputer:
                 endpoint_node=endpoint_node,
             )
 
-        # 已知必须回退
         if self._force_fallback:
             return self.weighted_fallback.compute_endpoint_importance(
                 g,
@@ -584,11 +574,8 @@ class _ImportanceComputer:
                 return out
             except TypeError as e:
                 msg = str(e)
-                # 典型“这个 kw 不支持”的情况：继续试别的 kw
                 if "unexpected keyword" in msg or "got an unexpected keyword" in msg:
                     continue
-
-                # 其他 TypeError：说明原实现加权接口不稳妥，回退
                 self._log_fallback_once(
                     f"BPNPropagator 加权调用失败（{msg}），将切换到脚本内置 NUIAT 加权传播实现。"
                 )
@@ -619,14 +606,20 @@ class _ImportanceComputer:
 # 主逻辑
 # --------------------
 
-
 def _get_dataset_path(cfg: Dict[str, Any]) -> str:
     """从 config 里解析出 dataset npz 路径。"""
+    # 核心修复点：优先读取 yaml 中 data -> dataset_npz 的配置
+    data_cfg = cfg.get("data", {})
+    dataset_path = data_cfg.get("dataset_npz")
+    if dataset_path:
+        return dataset_path
+
+    # 兜底兼容老的写在顶层的写法
     dataset_path = cfg.get("dataset_path")
     if dataset_path:
         return dataset_path
 
-    # 兼容老的 design/project_root 写法
+    # 再兜底兼容老的 design/project_root 写法
     project_root = cfg.get("project_root", ".")
     design = cfg.get("design", "my_design")
     dataset_path = os.path.join(project_root, "data", "processed", f"{design}.npz")
@@ -823,7 +816,7 @@ def run_bpn_analysis(cfg: Dict[str, Any]) -> None:
                     )
 
             record = {
-                "endpoint": ep_name,  # 原始名字，如 "_246_"
+                "endpoint": ep_name,
                 "endpoint_node": idx_to_name.get(ep_idx_int, "N/A")
                 if ep_idx_int is not None
                 else "N/A",

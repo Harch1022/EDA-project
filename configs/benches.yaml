@@ -1,4 +1,6 @@
 designs:
   - my_design
   - s298
+  - ibex
+  - aes
 # 在 data/benchmarks 下添加其它设计名并列在这里

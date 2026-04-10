@@ -60,7 +60,23 @@ class EndpointDataset(Dataset):
 
         # endpoint 标签
         self.endpoints = self.data["endpoints"]          # [E]
-        self.y_arrival = self.data["y_arrival"]          # [E]
+        
+        # ===== 极度稳健的 Min-Max 缩放到 [0, 1] =====
+        raw_y = self.data["y_arrival"].astype(np.float32)
+        if raw_y.size > 0:
+            y_min = float(np.min(raw_y))
+            y_max = float(np.max(raw_y))
+            y_range = y_max - y_min
+            
+            # 如果所有的值都一样，强制拉平到 0.5
+            if y_range < 1e-6:
+                self.y_arrival = np.full_like(raw_y, 0.5)
+            else:
+                self.y_arrival = (raw_y - y_min) / y_range
+        else:
+            self.y_arrival = raw_y # 空数组原样返回
+        # ========================================================
+        
         self.cpl_indices = self.data["cpl_indices"]      # list[list[int]]
 
         # 可视化需要的 name_to_idx / idx_to_name
@@ -100,7 +116,6 @@ class EndpointDataset(Dataset):
         ci = list(self.cpl_indices[idx])
         ep_name = str(self.endpoints[idx])
         ep_id = idx
-        # 把 self 也返回出去，充当“移动的图结构仓库”
         return ep_id, y, ci, ep_name, self
 
 
@@ -112,7 +127,6 @@ def _infer_bpn_importance_path(dataset_npz: str) -> str:
 
 def _load_bpn_importance(importance_npz: str, num_nodes: int) -> Optional[Dict[str, Any]]:
     if not os.path.exists(importance_npz):
-        logger.info("BPN importance file not found: %s", importance_npz)
         return None
     arr = np.load(importance_npz, allow_pickle=True)
     endpoints = [str(e) for e in arr["endpoints"]]
@@ -189,18 +203,26 @@ def _groupwise_topk_recall(
     return float(np.mean(vals)) if vals else float("nan")
 
 
-def _kendall_tau_np(y_true: np.ndarray, y_pred: np.ndarray, tie_epsilon: float = 1e-12) -> float:
+# 【核心修复 1】：剔除 tie 当成错排的 Bug
+def _kendall_tau_np(y_true: np.ndarray, y_pred: np.ndarray, mode: str = "high", tie_epsilon: float = 1e-12) -> float:
     n = int(y_true.shape[0])
     if n < 2:
         return float("nan")
 
     idx_i, idx_j = np.triu_indices(n, k=1)
+    
+    if mode == "low":
+        y_true = -y_true
+        y_pred = -y_pred
+        
     diff_t = y_true[idx_i] - y_true[idx_j]
-    valid = np.abs(diff_t) > tie_epsilon
-    if not np.any(valid):
-        return float("nan")
-
     diff_p = y_pred[idx_i] - y_pred[idx_j]
+
+    # 只统计 y_true 和 y_pred 都真正有差别的 pair
+    valid = (np.abs(diff_t) > tie_epsilon) & (np.abs(diff_p) > tie_epsilon)
+    if not np.any(valid):
+        return 0.0
+
     sign_t = np.sign(diff_t[valid])
     sign_p = np.sign(diff_p[valid])
 
@@ -214,6 +236,7 @@ def _groupwise_kendall_tau(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     groups: np.ndarray,
+    mode: str = "high",
     max_samples_per_group: int = 1024,
     seed: int = 42,
 ) -> float:
@@ -235,7 +258,7 @@ def _groupwise_kendall_tau(
             yt = yt[sel]
             yp = yp[sel]
 
-        tau = _kendall_tau_np(yt, yp)
+        tau = _kendall_tau_np(yt, yp, mode=mode)
         if not np.isnan(tau):
             vals.append(float(tau))
 
@@ -369,7 +392,6 @@ def train_loop(cfg: Dict[str, object]):
     d_node = datasets[0].node_features.shape[1]
     logger.info("Concatenated %d endpoints from %d designs.", n, len(datasets))
 
-    # 建立 global_idx -> design_id 映射（ConcatDataset 的顺序与 datasets 一致）
     global_idx_to_design = np.empty(n, dtype=np.int64)
     all_targets_global = np.empty(n, dtype=np.float32)
     cursor = 0
@@ -410,14 +432,24 @@ def train_loop(cfg: Dict[str, object]):
             N_ds_nodes = ds.node_features.shape[0]
             teacher = _load_bpn_importance(imp_path, num_nodes=N_ds_nodes)
 
+            # 【核心修复 2】：不允许 teacher_pool 静默退化为 uniform
             if teacher is None:
-                logger.warning("Teacher not found for %s. Fallback to uniform.", ds.npz_path)
-                ds.teacher_map = {
-                    str(ep): np.ones(N_ds_nodes, dtype=np.float32) / N_ds_nodes
-                    for ep in ds.endpoints
-                }
+                if use_ep_condition and ep_mode in ("teacher_pool", "hybrid"):
+                    raise RuntimeError(f"Teacher not found for {ds.npz_path}. teacher_pool mode requires strict BPN maps.")
+                else:
+                    logger.warning("Teacher not found for %s. Fallback to uniform.", ds.npz_path)
+                    ds.teacher_map = {
+                        str(ep): np.ones(N_ds_nodes, dtype=np.float32) / N_ds_nodes
+                        for ep in ds.endpoints
+                    }
             else:
                 has_any_teacher = True
+                
+                # 检查覆盖率
+                missing = [str(e) for e in ds.endpoints if str(e) not in teacher["map_by_name"]]
+                if missing and use_ep_condition and ep_mode in ("teacher_pool", "hybrid"):
+                    raise RuntimeError(f"Missing teacher maps for {len(missing)} endpoints in {ds.npz_path}. Example: {missing[0]}")
+                
                 rng = np.random.default_rng(ablation_seed)
                 base_map = teacher["map_by_name"]
 
@@ -445,7 +477,6 @@ def train_loop(cfg: Dict[str, object]):
                     map_by_name_full[name] = vec
                 ds.teacher_map = map_by_name_full
 
-            # 转为 Torch 张量存储在 dataset 实例中，加速前向传播
             ds.p_teacher_t = {name: torch.from_numpy(vec) for name, vec in ds.teacher_map.items()}
 
     if need_teacher and not has_any_teacher:
@@ -475,7 +506,7 @@ def train_loop(cfg: Dict[str, object]):
         d_node_emb = gnn_hidden
         if ep_mode == "id":
             d_ep_in = d_ep_id
-        elif ep_mode == "teacher_pool":
+        elif ep_mode in ("teacher_pool", "node"):
             d_ep_in = d_node_emb
         elif ep_mode == "hybrid":
             d_ep_in = d_ep_id + d_node_emb
@@ -508,7 +539,6 @@ def train_loop(cfg: Dict[str, object]):
         max_pairs=int(loss_cfg.get("max_pairs", 0)),
     )
 
-    # 这里的 batch_size 是“逻辑 micro-batch”大小，不是图拼 batch
     loss_batch_size = int(train_cfg.get("batch_size", loss_cfg.get("ranking_batch_size", 16)))
     loss_batch_size = max(loss_batch_size, 1)
 
@@ -557,9 +587,6 @@ def train_loop(cfg: Dict[str, object]):
     if limit_train > 0:
         tr_idx = tr_idx[: min(limit_train, len(tr_idx))]
 
-    # ------------------------------------------------------------------
-    # 针对 CP-aware weighting：按 split + 按 design 计算阈值
-    # ------------------------------------------------------------------
     def _compute_design_thresholds(split_indices: List[int]) -> Dict[int, float]:
         crit_frac = float(loss_fn.critical_fraction)
         crit_weight = float(loss_fn.critical_weight)
@@ -586,10 +613,6 @@ def train_loop(cfg: Dict[str, object]):
     train_design_thresholds = _compute_design_thresholds(tr_idx)
     val_design_thresholds = _compute_design_thresholds(va_idx)
 
-    # ------------------------------------------------------------------
-    # 为 ranking loss 构造按 design 分组的 epoch 顺序
-    # 这样每个微批次都来自同一个 design，避免跨设计 pairwise 排序
-    # ------------------------------------------------------------------
     def _build_epoch_order(split_indices: List[int], train: bool = True) -> List[int]:
         if not split_indices:
             return []
@@ -636,9 +659,6 @@ def train_loop(cfg: Dict[str, object]):
             return base_bpn_loss_weight * (epoch - warmup_ep) / max(ramp_ep, 1)
         return base_bpn_loss_weight
 
-    # ------------------------------------------------------------------
-    # 动态前向传播 + 逻辑微批次累计
-    # ------------------------------------------------------------------
     def run_epoch(
         idxs: List[int],
         train: bool = True,
@@ -736,7 +756,6 @@ def train_loop(cfg: Dict[str, object]):
             for global_idx in work_idxs:
                 design_id = int(global_idx_to_design[global_idx])
 
-                # design 切换时先 flush，保证 ranking batch 不跨设计
                 if pending_design_id is not None and design_id != pending_design_id and pending_preds:
                     flush_pending()
                     pending_design_id = None
@@ -752,7 +771,7 @@ def train_loop(cfg: Dict[str, object]):
                 maps = current_ds.maps_t.to(device)
 
                 need_node_emb = (
-                    (use_ep_condition and ep_mode in ("teacher_pool", "hybrid"))
+                    (use_ep_condition and ep_mode in ("teacher_pool", "hybrid", "node"))  # <--- 把 "node" 加进这里
                     or (imp_head is not None and current_ds.teacher_map is not None and bpn_weight > 0.0)
                 )
 
@@ -773,6 +792,21 @@ def train_loop(cfg: Dict[str, object]):
                     elif ep_mode == "id":
                         ep_idx_t = torch.tensor([int(global_idx)], dtype=torch.long, device=device)
                         z_ep = ep_dropout(ep_emb(ep_idx_t))
+                    
+                    # ===== 【新增代码】：使用端点自身的原生图特征 =====
+                    elif ep_mode == "node":
+                        ep_idx = current_ds.name_to_idx.get(ep_name_str, None)
+                        if ep_idx is not None and 0 <= ep_idx < node_emb.shape[0]:
+                            z_ep = node_emb[ep_idx].unsqueeze(0)   # <--- 加上 .unsqueeze(0)
+                        else:
+                            # 兜底：如果没找到端点，用相关路径起点的均值特征
+                            valid_ci = [i for i in ci if 0 <= i < node_emb.shape[0]]
+                            if valid_ci:
+                                ci_tensor = torch.tensor(valid_ci, dtype=torch.long, device=device)
+                                z_ep = node_emb[ci_tensor].mean(dim=0).unsqueeze(0)   # <--- 加上 .unsqueeze(0)
+                            else:
+                                z_ep = node_emb.mean(dim=0).unsqueeze(0)   # <--- 加上 .unsqueeze(0)
+                    # =================================================
 
                     elif ep_mode == "hybrid":
                         pt = current_ds.p_teacher_t[ep_name_str].to(device=device, dtype=node_emb.dtype)
@@ -838,11 +872,24 @@ def train_loop(cfg: Dict[str, object]):
         avg_bpn_term = bpn_term_sum / max(num_samples, 1)
 
         if y_true_np.size > 0:
+            # 【核心修复 3】：在合并打印前，按设计分别打印统计值和 Tau，揪出预测塌缩的设计
+            for gid in np.unique(group_np):
+                mask = group_np == gid
+                yt_g = y_true_np[mask]
+                yp_g = y_pred_np[mask]
+                if yt_g.size > 1:
+                    tau_g = _kendall_tau_np(yt_g, yp_g, mode=loss_fn.critical_mode)
+                    recall_g = _topk_recall_single(yt_g, yp_g, frac=recall_top_fraction, mode=loss_fn.critical_mode)
+                    logger.info("Split=%s | Design %d: std_true=%.4f std_pred=%.4f Tau=%.4f Recall=%.4f", 
+                                "train" if train else "val", gid, float(np.std(yt_g)), float(np.std(yp_g)), tau_g, recall_g)
+            
             r2_val = float(r2_score(y_true_np, y_pred_np)) if y_true_np.size > 1 else float("nan")
+            
             tau_val = _groupwise_kendall_tau(
                 y_true_np,
                 y_pred_np,
                 group_np,
+                mode=loss_fn.critical_mode,
                 max_samples_per_group=tau_max_samples_per_group,
                 seed=seed + (1 if train else 2),
             )
@@ -855,7 +902,7 @@ def train_loop(cfg: Dict[str, object]):
             )
 
             logger.info(
-                "Split=%s: total=%.4f core=%.4f mse=%.4f rank=%.4f cpl=%.4f bpn=%.4f R2=%.4f Tau=%.4f Recall@%.0f%%=%.4f",
+                "Split=%s [Global]: total=%.4f core=%.4f mse=%.4f rank=%.4f cpl=%.4f bpn=%.4f R2=%.4f Tau=%.4f Recall@%.0f%%=%.4f",
                 "train" if train else "val",
                 avg_total,
                 avg_core,
@@ -914,7 +961,7 @@ def train_loop(cfg: Dict[str, object]):
         best_ckpt = os.path.join(save_dir, "best.pt")
         if os.path.exists(best_ckpt):
             try:
-                state = torch.load(best_ckpt, map_location=device)
+                state = torch.load(best_ckpt, map_location=device, weights_only=True)
                 bpn.load_state_dict(state["bpn"])
                 cnn.load_state_dict(state["cnn"])
                 head.load_state_dict(state["head"])

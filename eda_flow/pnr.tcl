@@ -1,5 +1,10 @@
 # -----------------------------------------------------------
 # pnr.tcl - OpenROAD Place & Route Script (容错 + 报告导出)
+# 用途：
+#   - 面向 ML for EDA 的快速 PnR / timing feature 提取
+#   - 有意弱化 PG/DRC 完整性，只求尽量跑通 detailed_route
+# 注意：
+#   - 不适用于 signoff / tapeout
 # -----------------------------------------------------------
 
 # 工艺/库/输入网表（按需修改）
@@ -12,28 +17,24 @@ proc env_or {name default} {
   }
 }
 
-# 一个小工具：尽量多打一些 timing 路径（兼容不同 OpenROAD/OpenSTA 版本）
+# 关键修改 2：
+# 尽量多打一些 timing 路径，兼容不同 OpenROAD/OpenSTA 版本
+# 优先级：
+#   1) -group_count 5000 -endpoint_count 5000
+#   2) -path_count 5000
+#   3) -slack_max 100.0
 proc report_checks_extended {} {
-  # 公共参数
   set base_opts {-path_delay min_max -fields {slew cap input_pins} -digits 4 -format full_clock_expanded}
 
-  # 1) 优先尝试 -path_count（部分版本支持）
-  if {![catch {eval report_checks $base_opts -path_count 2000}]} {
-    return
+  if {[catch {
+    eval report_checks $base_opts -group_count 5000 -endpoint_count 5000
+  }]} {
+    if {[catch {
+      eval report_checks $base_opts -path_count 5000
+    }]} {
+      eval report_checks $base_opts -slack_max 100.0
+    }
   }
-
-  # 2) 尝试 -max_paths（有些版本用这个名字）
-  if {![catch {eval report_checks $base_opts -max_paths 2000}]} {
-    return
-  }
-
-  # 3) 尝试 -nworst（某些 STA 接口习惯用的命名）
-  if {![catch {eval report_checks $base_opts -nworst 2000}]} {
-    return
-  }
-
-  # 4) 全都不支持就退回最原始的调用（你之前的行为）
-  eval report_checks $base_opts
 }
 
 # 设计 / 工程目录 / 输出目录
@@ -41,7 +42,7 @@ set DESIGN_NAME [env_or DESIGN_NAME "my_design"]
 set PROJECT_DIR [env_or PROJECT_DIR "/home/lzz_linux/fyp-project"]
 set OUT_DIR     [env_or OUT_DIR     "$PROJECT_DIR/data/raw_eda/$DESIGN_NAME"]
 set SKIP_CTS    [expr {[info exists ::env(SKIP_CTS)] && $::env(SKIP_CTS) ne ""}]
-# 新增：顶层模块名，缺省用 DESIGN_NAME
+# 顶层模块名，缺省用 DESIGN_NAME
 set TOP_MODULE  [env_or TOP_MODULE  $DESIGN_NAME]
 
 # 工艺/库/输入网表（按需修改，允许使用 eda_flow/lib 路径）
@@ -75,7 +76,8 @@ if {$LEF_STD ne ""} {
 # ---------------- 2) 读取综合网表并链接 ----------------
 puts "==> Reading synthesized netlist: $NETLIST"
 read_verilog $NETLIST
-# 关键修改：用 TOP_MODULE，而不是 DESIGN_NAME
+
+# 关键修改 1：用 TOP_MODULE，而不是 DESIGN_NAME
 link_design $TOP_MODULE
 
 # ---------------- 3) 约束：优先读取 SDC，回退自动识别 ----------------
@@ -160,6 +162,7 @@ if {$SKIP_CTS} {
       exit 1
     }
   }
+
   puts "INFO: Post-CTS incremental placement..."
   if {[catch { global_placement -density 0.7 -incremental } emsg]} {
     puts "WARN: global_placement -incremental failed or not supported: $emsg"
@@ -172,15 +175,40 @@ if {$SKIP_CTS} {
 }
 
 # ---------------- 7) 全局/详细布线 ----------------
+
+# 关键修改 3：在 global_route 之前绑定标准电源/地网
+puts "==> Binding standard VDD/VSS global connections"
+add_global_connection -net VDD -inst_pattern .* -pin_pattern {^VDD$} -power
+add_global_connection -net VSS -inst_pattern .* -pin_pattern {^VSS$} -ground
+global_connect
+
+# 关键修改 4：
+# 绝对不用 get_nets；必须走 OpenDB。
+# 将除真正 VDD/VSS 之外的所有 POWER/GROUND 常量网强制降级为 SIGNAL，
+# 以绕过 TritonRoute 的 DRT-0305。
+puts "==> Downgrading internal POWER/GROUND constant nets to SIGNAL"
+set block [ord::get_db_block]
+set patched_pg_nets 0
+
+foreach db_net [$block getNets] {
+  set net_name [$db_net getName]
+  set sig_type [string toupper [$db_net getSigType]]
+
+  if {(($sig_type eq "POWER") || ($sig_type eq "GROUND")) &&
+      ($net_name ne "VDD") && ($net_name ne "VSS")} {
+    $db_net setSigType "SIGNAL"
+    incr patched_pg_nets
+  }
+}
+
+puts "INFO: Downgraded $patched_pg_nets internal POWER/GROUND nets to SIGNAL."
+
 puts "==> Global route"
 global_route
 
 puts "==> Detailed route"
-# 兼容不同版本的 DRT DRC 报告参数
-if {[catch { detailed_route -output_drc $OUT_DIR/$DESIGN_NAME.drc.rpt } drt_msg]} {
-  puts "INFO: detailed_route -output_drc not supported: $drt_msg"
-  detailed_route
-}
+# 去掉 -output_drc，避免部分版本/场景报错
+detailed_route
 
 # ---------------- 8) （可选）后布线优化（版本兼容） ----------------
 puts "==> Post-route optimization (if available)"

@@ -4,7 +4,9 @@ grid_size: 64
 
 benches:
   - my_design
-  - s298  # 这里保持你的设计名，如果有多个设计就继续往下加
+  - s298
+  - ibex  # 这里保持你的设计名，如果有多个设计就继续往下加
+
 
 near_critical:
   # 新增模式：'ratio_to_worst' | 兼容旧模式：'delta_abs' | 'quantile' | 'best_only'
@@ -18,8 +20,10 @@ near_critical:
   inner_mode: delta_abs   # 可选：delta_abs | quantile | best_only
 
   # 内部模式对应的参数（当 inner_mode=delta_abs/quantile 时生效）：
-  delta_ns: 0.02
-  quantile: 0.10
+  delta_ns: 5.0
+  quantile: 0.5
+
+
 
   # 是否保留未选中的端点（仅给它们 best_only 标签），方便兼容旧流程：
   keep_non_selected: true
