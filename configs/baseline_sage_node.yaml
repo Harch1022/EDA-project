@@ -1,0 +1,84 @@
+seed: 42
+device: "cpu"   # 如有 CUDA 可改为 "cuda"
+
+vis:
+  dump_node_importance: false            # 【修改】关闭导出开关，基线模型无此模块
+  source: "teacher"                      
+  outdir: "results/vis/node_importance"  
+
+train:
+  epochs: 30
+  batch_size: 16                         # 必须 >= 2，否则无法计算成对排序损失
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+
+model:
+  encoder_type: "sage"           # 【新增】启用 GCN 编码器
+  use_edge_weight: false         # 【新增】保留曼哈顿空间边权
+  gnn_hidden: 64
+  gnn_layers: 3
+  cnn_channels: [16, 32]
+  fusion_hidden: 64
+  use_endpoint_condition: true
+  endpoint_dim: 16
+
+  # 端点条件化模式
+  endpoint_conditioning:
+    mode: node                  # 【修改】退化为纯节点映射，不使用混合先验
+    dropout: 0.3    
+
+# ==========================================
+# 全新升级的复合损失函数配置 (Task 4)
+# ==========================================
+loss:
+  mse_weight: 1.0           # 保持绝对误差的基础拟合
+  rank_weight: 0.2          # 保持激活 Pairwise Ranking Loss 以保证对比公平
+  cpl_weight: 0.0           # 保持原有的 CPL 正则惩罚
+  critical_fraction: 0.10   # 关注 Top-10% 的卡脖子路径
+  critical_weight: 2.0      # 对这些卡脖子路径施加 2 倍的梯度惩罚
+  critical_mode: "high"     
+  pairwise_loss: "logistic" # 使用 logistic 使得梯度更平滑
+  pairwise_margin: 0.0
+  pair_gap_power: 0.0
+  tie_epsilon: 1.0e-8
+  max_pairs: 0              # 0 表示使用 mini-batch 内所有有效 pair
+
+data:
+  dataset_npz: "data/processed/aes.npz" # 注：联合训练时会自动扫描同目录下所有.npz
+  vocab_json:  "data/processed/vocab.json"
+  train_split: 0.8
+  val_split: 0.2
+
+# BPN 配置
+bpn:
+  # —— 离线 BPN 分析与 NUIAT 注入 ——
+  use_bpn: false           
+  steps_fwd: 6
+  steps_bwd: 6
+  decay_fwd: 0.9
+  decay_bwd: 0.9
+  combine: hadamard       
+  out_norm: l1            
+  degree_norm: out        
+  include_seed: true
+  topk: 5
+  max_endpoints: 10       
+  save_maps: true
+
+  # 【核心新增】NUIAT 温度控制
+  use_nuiat_softmax: false      # 【修改】基线模型关闭 NUIAT 温度先验
+  nuiat_temperature: 0.05
+
+  # —— 训练融合：BPN 辅助监督 ——
+  use_bpn_in_loss: false        # 【修改】彻底关闭 BPN 的辅助监督
+  bpn_loss_type: kl
+  bpn_loss_weight: 0.0          # 【修改】权重归零
+  temperature: 1.0
+  importance_npz: null    
+  ablation: none          
+  ablation_seed: 123
+  warmup_epochs: 4       
+  ramp_epochs: 8         
+
+debug:
+  limit_train_samples: 0
